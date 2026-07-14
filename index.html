@@ -228,11 +228,11 @@ try{
   log('Mesh added to scene');
 
   let t=0, frameCount=0, loggedFirstFrame=false, loggedError=false;
-  renderer.setAnimationLoop(()=>{
+  async function frame(){
     try{
       t += 0.008;
       mesh.rotation.y = t;
-      renderer.render(scene, camera);
+      await renderer.renderAsync(scene, camera);
       frameCount++;
       if(!loggedFirstFrame){
         loggedFirstFrame = true;
@@ -245,7 +245,9 @@ try{
         log('RENDER LOOP ERROR (frame '+frameCount+'): '+e.message);
       }
     }
-  });
+    requestAnimationFrame(frame);
+  }
+  frame();
   window.__ready = true;
   log('READY — rotating view');
 }catch(e){
