@@ -115,32 +115,37 @@ try{
     const cy = crem.div(uint(N));
     const cx = crem.mod(uint(N));
 
-    const cornerPos = array('vec3', 8);
-    const cornerDensity = array('float', 8);
-
-    Loop(8, ({i})=>{
-      const dx = i.bitAnd(1);
-      const dy = i.bitAnd(2).shiftRight(1);
-      const dz = i.bitAnd(4).shiftRight(2);
+    // Real bug found (previous version): corner data was stored in a
+    // local array() and written/read via dynamic (runtime-computed)
+    // indices inside nested Loops. Dynamic indexing into a *local*
+    // array (as opposed to a storage buffer, which genuinely supports
+    // it) is a known fragile pattern across shader compilers/backends —
+    // here it silently produced wrong data instead of erroring, which is
+    // exactly why the compute pass reported success while the geometry
+    // came out collapsed into a thin sliver instead of a real sphere.
+    // Fixed by unrolling all 8 corners into explicit named variables —
+    // no dynamic array indexing anywhere in this function now.
+    const readCorner = (i)=>{
+      const dx = i & 1, dy = (i>>1) & 1, dz = (i>>2) & 1;
       const gx = cx.add(dx), gy = cy.add(dy), gz = cz.add(dz);
       const flat = gx.add(gy.mul(uint(GRID))).add(gz.mul(uint(GRID*GRID)));
-      cornerPos.element(i).assign(vec3(
-        gx.toFloat().mul(CELL).sub(1.0),
-        gy.toFloat().mul(CELL).sub(1.0),
-        gz.toFloat().mul(CELL).sub(1.0)
-      ));
-      cornerDensity.element(i).assign(densityNode.element(flat));
-    });
+      return {
+        pos: vec3(gx.toFloat().mul(CELL).sub(1.0), gy.toFloat().mul(CELL).sub(1.0), gz.toFloat().mul(CELL).sub(1.0)),
+        density: densityNode.element(flat),
+      };
+    };
+    const c0=readCorner(0), c1=readCorner(1), c2=readCorner(2), c3=readCorner(3),
+          c4=readCorner(4), c5=readCorner(5), c6=readCorner(6), c7=readCorner(7);
+    const corners = [c0,c1,c2,c3,c4,c5,c6,c7];
 
     const caseIdx = int(0).toVar();
-    Loop(8, ({i})=>{
-      If(cornerDensity.element(i).lessThan(0.0), ()=>{
-        caseIdx.assign(caseIdx.bitOr(int(1).shiftLeft(i)));
+    corners.forEach((c,i)=>{
+      If(c.density.lessThan(0.0), ()=>{
+        caseIdx.assign(caseIdx.bitOr(int(1<<i)));
       });
     });
 
     const outBase = cellIdx.mul(uint(MAX_TRIS_PER_CELL*3));
-    // zero out this cell's slots by default (degenerate triangles)
     Loop(MAX_TRIS_PER_CELL*3, ({i})=>{
       vertexNode.element(outBase.add(uint(i))).assign(vec3(0,0,0));
       normalNode.element(outBase.add(uint(i))).assign(vec3(0,1,0));
@@ -153,16 +158,18 @@ try{
         const e1 = triTableStorage.element(triBase.add(1));
         const e2 = triTableStorage.element(triBase.add(2));
 
+        // 12-way select over the fixed EdgeVertexIndices pairs, using
+        // the explicit unrolled corner variables — no array indexing.
         const interp = (edge)=>{
-          // 12-way select over the fixed EdgeVertexIndices pairs.
-          let a = int(0), b = int(0);
-          for(let k=0;k<12;k++){
-            const [va,vb] = EdgeVertexIndices[k];
-            a = select(edge.equal(int(k)), int(va), a);
-            b = select(edge.equal(int(k)), int(vb), b);
-          }
-          const da = cornerDensity.element(a), db = cornerDensity.element(b);
-          const pa = cornerPos.element(a), pb = cornerPos.element(b);
+          let pa = corners[0].pos, pb = corners[0].pos;
+          let da = corners[0].density, db = corners[0].density;
+          EdgeVertexIndices.forEach(([va,vb], k)=>{
+            const match = edge.equal(int(k));
+            pa = select(match, corners[va].pos, pa);
+            pb = select(match, corners[vb].pos, pb);
+            da = select(match, corners[va].density, da);
+            db = select(match, corners[vb].density, db);
+          });
           const t = da.div(da.sub(db).add(1e-6));
           return pa.add(pb.sub(pa).mul(t));
         };
