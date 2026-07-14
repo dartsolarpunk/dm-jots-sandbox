@@ -227,11 +227,24 @@ try{
   scene.add(mesh);
   log('Mesh added to scene');
 
-  let t=0;
+  let t=0, frameCount=0, loggedFirstFrame=false, loggedError=false;
   renderer.setAnimationLoop(()=>{
-    t += 0.008;
-    mesh.rotation.y = t;
-    renderer.render(scene, camera);
+    try{
+      t += 0.008;
+      mesh.rotation.y = t;
+      renderer.render(scene, camera);
+      frameCount++;
+      if(!loggedFirstFrame){
+        loggedFirstFrame = true;
+        log('First frame rendered without error');
+      }
+      if(frameCount===60) log('60 frames rendered — loop is running continuously');
+    }catch(e){
+      if(!loggedError){
+        loggedError = true;
+        log('RENDER LOOP ERROR (frame '+frameCount+'): '+e.message);
+      }
+    }
   });
   window.__ready = true;
   log('READY — rotating view');
