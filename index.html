@@ -444,6 +444,7 @@ try{
   // the animated DirectionalLight - a uniform, not baked into the graph,
   // since the sun actually moves (day/night cycle).
   const sunDirUniform = uniform(new THREE.Vector3(1,0,0));
+  const atmoDebugUniform = uniform(0); // set via window.ATMO_DEBUG = true/false at runtime
 
   // Ray-sphere intersection: returns vec3(distToSphere, distThroughSphere,
   // hitFlag). hitFlag is 0 if the ray misses the sphere entirely.
@@ -497,11 +498,18 @@ try{
     const surfaceViewZ = perspectiveDepthToViewZ(atmoDepthNode.r, cameraNear, cameraFar);
     const surfaceDist = surfaceViewZ.negate();
 
-    const marchStart = hit.x;
-    const marchLen = hit.y.min(surfaceDist.sub(marchStart).max(0.0));
+  const marchStart = hit.x;
+  const surfaceClampActive = surfaceDist.sub(marchStart).lessThan(hit.y); // true where the solid surface is actually cutting the march short
+  const marchLen = hit.y.min(surfaceDist.sub(marchStart).max(0.0));
 
-    const inScatter = vec3(0,0,0).toVar();
-    If(hit.z.greaterThan(0.5), ()=>{
+  // Debug visualization: window.ATMO_DEBUG = true recolors the effect
+  // solid red wherever the depth clamp is genuinely limiting the ray
+  // (i.e., 'a solid surface is correctly in the way here') vs the
+  // normal scattering color where it's not (limb of the planet, open
+  // space) — makes the actual clamp behavior directly visible instead
+  // of only inferable from reading the shader code.
+  const inScatter = vec3(0,0,0).toVar();
+  If(hit.z.greaterThan(0.5), ()=>{
       const stepSize = marchLen.div(VIEW_SAMPLES);
       const p = camRayOrigin.add(rayDirAtmo.mul(marchStart)).toVar();
       const viewOpticalDepth = float(0).toVar();
@@ -518,7 +526,8 @@ try{
         p.addAssign(rayDirAtmo.mul(stepSize));
       });
     });
-    return inScatter;
+    const debugColor = mix(inScatter, vec3(1,0,0), atmoDebugUniform.mul(select(surfaceClampActive,1.0,0.0)));
+    return debugColor;
   });
 
   const atmoInScatter = atmosphereFn();
@@ -725,6 +734,7 @@ try{
       sunAngle += dt*0.04; // slow day/night cycle
       sun.position.set(Math.cos(sunAngle)*80, Math.sin(sunAngle)*80, 30);
       sunDirUniform.value.copy(sun.position).normalize();
+      atmoDebugUniform.value = window.ATMO_DEBUG ? 1 : 0;
       const daylight = Math.max(0.15, Math.sin(sunAngle));
       sun.intensity = 1.0 + daylight*2.6;
 
