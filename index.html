@@ -74,9 +74,9 @@ try{
   const edgeMaskStorage = storage(edgeMaskAttr, 'int', 256);
   const triTableStorage = storage(triTableAttr, 'int', 256*16);
 
-  const vertexBuf = new THREE.StorageInstancedBufferAttribute(maxVerts, 3);
+  const vertexBuf = new THREE.StorageBufferAttribute(maxVerts, 3);
   const vertexNode = storage(vertexBuf, 'vec3', maxVerts);
-  const normalBuf = new THREE.StorageInstancedBufferAttribute(maxVerts, 3);
+  const normalBuf = new THREE.StorageBufferAttribute(maxVerts, 3);
   const normalNode = storage(normalBuf, 'vec3', maxVerts);
 
   log('Buffers allocated');
