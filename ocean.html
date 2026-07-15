@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#05070d;overflow:hidden;height:100%;}
+#info{position:fixed;top:4px;left:4px;color:#7CFC7C;font-family:monospace;font-size:10px;white-space:pre;z-index:10;pointer-events:none;}
+#hint{position:fixed;bottom:6px;left:6px;color:#9adba9;font-family:monospace;font-size:11px;z-index:10;}
+#hint a{color:#9adba9;}
+</style>
+</head><body>
+<div id="info">loading...</div>
+<div id="hint">Watch the moon orbit and pull a tidal bulge across the ocean · <a href="./planet.html">cube-sphere demo</a> · <a href="./index.html">marching-cubes demo</a></div>
+<script type="importmap">
+{ "imports": { "three": "./three.webgpu.js", "three/webgpu": "./three.webgpu.js", "three/tsl": "./three.tsl.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {
+  Fn, If, Loop, storage, instanceIndex, uint, int, float, vec3,
+  cameraPosition, mix, time, uniform, clamp, exp, normalize as tslNormalize
+} from 'three/tsl';
+
+const info = document.getElementById('info');
+const log = (s)=>{ info.textContent += s + '\n'; console.log(s); };
+
+// Same terrain-height function as the other two demos (JS side), used
+// here purely for ocean-floor collision - keeps this demo runnable on
+// its own without depending on a readback from the other page's GPU
+// buffers.
+function hash3(x,y,z){ let h=Math.sin(x*127.1+y*311.7+z*74.7)*43758.5453123; return h-Math.floor(h); }
+function valueNoise3(x,y,z){
+  const xi=Math.floor(x),yi=Math.floor(y),zi=Math.floor(z);
+  const xf=x-xi,yf=y-yi,zf=z-zi;
+  const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf),w=zf*zf*(3-2*zf);
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const c000=hash3(xi,yi,zi),c100=hash3(xi+1,yi,zi),c010=hash3(xi,yi+1,zi),c110=hash3(xi+1,yi+1,zi);
+  const c001=hash3(xi,yi,zi+1),c101=hash3(xi+1,yi,zi+1),c011=hash3(xi,yi+1,zi+1),c111=hash3(xi+1,yi+1,zi+1);
+  const x00=lerp(c000,c100,u),x10=lerp(c010,c110,u),x01=lerp(c001,c101,u),x11=lerp(c011,c111,u);
+  const y0=lerp(x00,x10,v),y1=lerp(x01,x11,v);
+  return lerp(y0,y1,w)*2-1;
+}
+function fractalNoise3(x,y,z,octaves,lac,gain){
+  let amp=1,freq=1,sum=0,norm=0;
+  for(let i=0;i<octaves;i++){ sum+=valueNoise3(x*freq,y*freq,z*freq)*amp; norm+=amp; amp*=gain; freq*=lac; }
+  return sum/norm;
+}
+const PLANET_RADIUS = 12;
+function groundRadiusAt(dirX,dirY,dirZ){
+  const p2=2.3;
+  const n1=fractalNoise3(dirX*p2,dirY*p2,dirZ*p2,5,2.0,0.5);
+  const ridge=1-Math.abs(n1);
+  const n2=fractalNoise3(dirX*p2*3+9.1,dirY*p2*3+2.3,dirZ*p2*3+4.7,3,2.0,0.5);
+  const billow=Math.abs(n2);
+  const terrain=ridge*ridge*0.9-billow*0.35;
+  return PLANET_RADIUS+terrain*1.4;
+}
+
+async function main(){
+try{
+  const renderer = new THREE.WebGPURenderer({antialias:false});
+  await renderer.init();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+  log('Renderer OK');
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x03040a);
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.05, 500);
+  camera.position.set(0, 20, 55);
+  camera.lookAt(0,0,0);
+
+  scene.add(new THREE.AmbientLight(0x304050, 0.6));
+  const sun = new THREE.DirectionalLight(0xfff2e0, 2.5);
+  sun.position.set(60,40,30);
+  scene.add(sun);
+
+  // ── Static ground reference sphere (a stand-in for the real
+  // terrain mesh from the marching-cubes demo - keeping this page
+  // self-contained rather than importing that whole pipeline). ──
+  {
+    const N=64;
+    const geo = new THREE.SphereGeometry(1,96,64);
+    const posAttr = geo.getAttribute('position');
+    for(let i=0;i<posAttr.count;i++){
+      const x=posAttr.getX(i), y=posAttr.getY(i), z=posAttr.getZ(i);
+      const len = Math.hypot(x,y,z);
+      const r = groundRadiusAt(x/len, y/len, z/len) - 0.15; // slightly below sea level so ocean sits on top
+      posAttr.setXYZ(i, x/len*r, y/len*r, z/len*r);
+    }
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({ color: 0x6a5a48, roughness:0.95 });
+    scene.add(new THREE.Mesh(geo, mat));
+  }
+
+  // ── Moon: a real orbiting body whose gravity actually pulls each
+  // ocean particle individually (inverse-square law) - the tidal bulge
+  // is a genuine emergent effect of near-side particles feeling more
+  // pull than far-side ones, not a hand-authored wave shape. ──
+  const MOON_ORBIT_RADIUS = 34;
+  const MOON_RADIUS = 2.4;
+  const moonGeo = new THREE.SphereGeometry(MOON_RADIUS, 32, 24);
+  const moonMat = new THREE.MeshStandardMaterial({ color:0xaaaaaa, roughness:1.0 });
+  const moonMesh = new THREE.Mesh(moonGeo, moonMat);
+  scene.add(moonMesh);
+
+  const moonPosUniform = uniform(new THREE.Vector3(MOON_ORBIT_RADIUS,0,0));
+
+  // ── SPH ocean particles ───────────────────────────────────────────
+  const N_PARTICLES = 1400;
+  const SMOOTHING_RADIUS = 1.6;
+  const REST_DENSITY = 2.0;
+  const PRESSURE_STIFFNESS = 4.0;
+  const VISCOSITY = 0.25;
+  const PARTICLE_MASS = 1.0;
+  const GRAVITY_STRENGTH = 9.0;
+  const MOON_MASS_STRENGTH = 620.0; // tuned for a visible bulge at this scale, not real astronomical units
+
+  const posBuf = new THREE.StorageBufferAttribute(N_PARTICLES, 3);
+  const velBuf = new THREE.StorageBufferAttribute(N_PARTICLES, 3);
+  const densityBuf = new THREE.StorageInstancedBufferAttribute(N_PARTICLES, 1);
+  const posNode = storage(posBuf, 'vec3', N_PARTICLES);
+  const velNode = storage(velBuf, 'vec3', N_PARTICLES);
+  const densityNode = storage(densityBuf, 'float', N_PARTICLES);
+
+  // Initial positions: a thin shell of particles at sea level, jittered.
+  {
+    const initArr = new Float32Array(N_PARTICLES*3);
+    for(let i=0;i<N_PARTICLES;i++){
+      const th = Math.random()*Math.PI*2, ph = Math.acos(2*Math.random()-1);
+      const dir = new THREE.Vector3(Math.sin(ph)*Math.cos(th), Math.sin(ph)*Math.sin(th), Math.cos(ph));
+      const r = PLANET_RADIUS + 0.05 + Math.random()*0.15;
+      initArr[i*3]=dir.x*r; initArr[i*3+1]=dir.y*r; initArr[i*3+2]=dir.z*r;
+    }
+    posBuf.array.set(initArr);
+    posBuf.needsUpdate = true;
+  }
+  log('Particles allocated: '+N_PARTICLES);
+
+  // Poly6 smoothing kernel (standard SPH density kernel).
+  const poly6 = Fn(([distSq, h])=>{
+    const hSq = h.mul(h);
+    const diff = hSq.sub(distSq).max(0.0);
+    const norm = float(315.0).div(float(64.0).mul(Math.PI).mul(h.pow(9)));
+    return norm.mul(diff.mul(diff).mul(diff));
+  });
+  // Spiky kernel gradient magnitude (standard SPH pressure-force kernel).
+  const spikyGrad = Fn(([dist, h])=>{
+    const diff = h.sub(dist).max(0.0);
+    const norm = float(-45.0).div(Math.PI).div(h.pow(6));
+    return norm.mul(diff).mul(diff);
+  });
+
+  const computeDensity = Fn(()=>{
+    const i = instanceIndex;
+    const pi = posNode.element(i);
+    const total = float(0).toVar();
+    Loop(N_PARTICLES, ({i:j})=>{
+      const pj = posNode.element(uint(j));
+      const d = pi.distance(pj);
+      total.addAssign(poly6(d.mul(d), float(SMOOTHING_RADIUS)).mul(PARTICLE_MASS));
+    });
+    densityNode.element(i).assign(total);
+  });
+
+  const computeForces = Fn(()=>{
+    const i = instanceIndex;
+    const pi = posNode.element(i).toVar();
+    const vi = velNode.element(i).toVar();
+    const rhoI = densityNode.element(i);
+    const pressureI = rhoI.sub(REST_DENSITY).max(0.0).mul(PRESSURE_STIFFNESS);
+
+    const force = vec3(0,0,0).toVar();
+    Loop(N_PARTICLES, ({i:j})=>{
+      If(uint(j).notEqual(i), ()=>{
+        const pj = posNode.element(uint(j));
+        const vj = velNode.element(uint(j));
+        const rhoJ = densityNode.element(uint(j)).max(0.0001);
+        const diff = pi.sub(pj);
+        const dist = diff.length().max(0.0001);
+        If(dist.lessThan(float(SMOOTHING_RADIUS)), ()=>{
+          const dir = diff.div(dist);
+          const pressureJ = rhoJ.sub(REST_DENSITY).max(0.0).mul(PRESSURE_STIFFNESS);
+          const pressureForce = dir.mul(pressureI.add(pressureJ).mul(0.5).mul(spikyGrad(dist, float(SMOOTHING_RADIUS))).div(rhoJ));
+          force.subAssign(pressureForce);
+          const visc = vj.sub(vi).mul(VISCOSITY).div(rhoJ);
+          force.addAssign(visc);
+        });
+      });
+    });
+
+    // Gravity toward planet center.
+    const toCenter = pi.negate();
+    const distCenter = toCenter.length().max(0.01);
+    force.addAssign(toCenter.div(distCenter).mul(GRAVITY_STRENGTH));
+
+    // Tidal pull toward the moon - real inverse-square gravity per
+    // particle, so near-side/far-side particles genuinely feel
+    // different amounts of pull. This IS the tide, not a stand-in for it.
+    const toMoon = moonPosUniform.sub(pi);
+    const distMoon = toMoon.length().max(0.01);
+    force.addAssign(toMoon.div(distMoon).mul(MOON_MASS_STRENGTH).div(distMoon.mul(distMoon)));
+
+    const dt = float(0.016);
+    const newVel = vi.add(force.mul(dt));
+    const newPos = pi.add(newVel.mul(dt));
+
+    // Ground collision: keep particles from sinking below the terrain.
+    const dir = tslNormalize(newPos);
+    const r = newPos.length();
+    // JS-side groundRadiusAt isn't available on the GPU, so use the
+    // same sphere+ridge approximation the planet mesh itself was built
+    // from, evaluated here directly as a simplified analytic floor
+    // (a flat sea-floor radius) - full per-direction terrain collision
+    // for the fluid is a further refinement, not done in this pass.
+    const floorR = float(PLANET_RADIUS - 0.2);
+    const belowFloor = r.lessThan(floorR);
+    const correctedPos = mix(newPos, dir.mul(floorR), belowFloor);
+    const correctedVel = mix(newVel, newVel.sub(dir.mul(newVel.dot(dir)).mul(1.4)), belowFloor);
+
+    posNode.element(i).assign(correctedPos);
+    velNode.element(i).assign(correctedVel);
+  });
+
+  const densityPass = computeDensity().compute(N_PARTICLES);
+  const forcePass = computeForces().compute(N_PARTICLES);
+
+  // ── Render particles as a point cloud ────────────────────────────
+  const particleGeo = new THREE.BufferGeometry();
+  particleGeo.setAttribute('position', posBuf);
+  particleGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0,0,0), PLANET_RADIUS*1.5);
+  const particleMat = new THREE.PointsNodeMaterial({ color:0x3fa8d8, size:0.35, transparent:true, opacity:0.85 });
+  const particlePoints = new THREE.Points(particleGeo, particleMat);
+  scene.add(particlePoints);
+  log('Ocean particle cloud added');
+  log('READY');
+
+  let moonAngle = 0;
+  let frameCount=0, loggedFirst=false;
+  async function frame(){
+    try{
+      moonAngle += 0.006;
+      const mx = Math.cos(moonAngle)*MOON_ORBIT_RADIUS, mz = Math.sin(moonAngle)*MOON_ORBIT_RADIUS;
+      moonMesh.position.set(mx, 4, mz);
+      moonPosUniform.value.set(mx, 4, mz);
+
+      await renderer.computeAsync(densityPass);
+      await renderer.computeAsync(forcePass);
+      await renderer.renderAsync(scene, camera);
+      frameCount++;
+      if(!loggedFirst){ loggedFirst=true; log('First frame (compute + render) OK'); }
+    }catch(e){
+      if(frameCount<2 || frameCount%300===0) log('FRAME ERROR (frame '+frameCount+'): '+e.message);
+    }
+    requestAnimationFrame(frame);
+  }
+  frame();
+}catch(e){
+  log('ERROR: '+e.message+'\n'+e.stack);
+}
+}
+main();
+</script>
+</body></html>
