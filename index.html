@@ -25,6 +25,7 @@
 <div id="tab-header">
   <button class="tab-btn active" id="tab-walk-btn">WALK (gamepad)</button>
   <button class="tab-btn" id="tab-orbit-btn">ORBIT (view whole planet)</button>
+  <button class="tab-btn" id="tab-tides-btn">TIDES (fluid sim)</button>
 </div>
 <div id="info">loading...</div>
 <div id="crosshair"></div>
@@ -151,6 +152,15 @@ try{
   orbitControls.minDistance = 40;
   orbitControls.maxDistance = 700;
   orbitControls.target.set(0,0,0);
+
+  const tidesCamera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.5, 2000);
+  tidesCamera.position.set(0, 45, 95);
+  const tidesControls = new OrbitControls(tidesCamera, renderer.domElement);
+  tidesControls.enableDamping = true;
+  tidesControls.minDistance = 30;
+  tidesControls.maxDistance = 400;
+  tidesControls.target.set(0,0,0);
+
   let activeCamera = walkCamera;
   let currentTab = 'walk';
 
@@ -691,19 +701,151 @@ try{
 
   log('Character controller ready (small-planet walker)');
 
+  // ── Tides tab: real per-frame SPH fluid simulation with a genuinely
+  // orbiting moon, added into this SAME scene (reusing PLANET_RADIUS and
+  // the terrain's own noise functions rather than duplicating a second
+  // copy) - only the camera/controls differ between tabs, not the
+  // underlying world. The smooth depth-shaded water sphere and the
+  // discrete SPH particles are two different representations of "the
+  // ocean" and would look redundant/cluttered shown together, so each
+  // tab shows only the one that matches what it's demonstrating.
+  const MOON_ORBIT_RADIUS = 70;
+  const MOON_RADIUS = 4.5;
+  const moonMesh = new THREE.Mesh(new THREE.SphereGeometry(MOON_RADIUS,32,24), new THREE.MeshStandardMaterial({color:0xaaaaaa, roughness:1.0}));
+  scene.add(moonMesh);
+  const moonPosUniform = uniform(new THREE.Vector3(MOON_ORBIT_RADIUS,0,0));
+
+  const N_PARTICLES = 1400;
+  const SMOOTHING_RADIUS = 1.6;
+  const REST_DENSITY = 2.0;
+  const PRESSURE_STIFFNESS = 4.0;
+  const VISCOSITY = 0.25;
+  const PARTICLE_MASS = 1.0;
+  const GRAVITY_STRENGTH = 9.0;
+  const MOON_MASS_STRENGTH = 620.0; // tuned for a visible bulge at this scale, not real astronomical units
+
+  const tidePosBuf = new THREE.StorageBufferAttribute(N_PARTICLES, 3);
+  const tideVelBuf = new THREE.StorageBufferAttribute(N_PARTICLES, 3);
+  const tideDensityBuf = new THREE.StorageInstancedBufferAttribute(N_PARTICLES, 1);
+  const tidePosNode = storage(tidePosBuf, 'vec3', N_PARTICLES);
+  const tideVelNode = storage(tideVelBuf, 'vec3', N_PARTICLES);
+  const tideDensityNode = storage(tideDensityBuf, 'float', N_PARTICLES);
+
+  {
+    const initArr = new Float32Array(N_PARTICLES*3);
+    for(let i=0;i<N_PARTICLES;i++){
+      const th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1);
+      const dir=new THREE.Vector3(Math.sin(ph)*Math.cos(th),Math.sin(ph)*Math.sin(th),Math.cos(ph));
+      const r = PLANET_RADIUS + 0.05 + Math.random()*0.15;
+      initArr[i*3]=dir.x*r; initArr[i*3+1]=dir.y*r; initArr[i*3+2]=dir.z*r;
+    }
+    tidePosBuf.array.set(initArr);
+    tidePosBuf.needsUpdate = true;
+  }
+
+  const poly6 = Fn(([distSq, h])=>{
+    const hSq = h.mul(h);
+    const diff = hSq.sub(distSq).max(0.0);
+    const norm = float(315.0).div(float(64.0).mul(Math.PI).mul(h.pow(9)));
+    return norm.mul(diff.mul(diff).mul(diff));
+  });
+  const spikyGrad = Fn(([dist, h])=>{
+    const diff = h.sub(dist).max(0.0);
+    const norm = float(-45.0).div(Math.PI).div(h.pow(6));
+    return norm.mul(diff).mul(diff);
+  });
+
+  const tideComputeDensity = Fn(()=>{
+    const i = instanceIndex;
+    const pi = tidePosNode.element(i);
+    const total = float(0).toVar();
+    Loop(N_PARTICLES, ({i:j})=>{
+      const pj = tidePosNode.element(uint(j));
+      const d = pi.distance(pj);
+      total.addAssign(poly6(d.mul(d), float(SMOOTHING_RADIUS)).mul(PARTICLE_MASS));
+    });
+    tideDensityNode.element(i).assign(total);
+  });
+
+  const tideComputeForces = Fn(()=>{
+    const i = instanceIndex;
+    const pi = tidePosNode.element(i).toVar();
+    const vi = tideVelNode.element(i).toVar();
+    const rhoI = tideDensityNode.element(i);
+    const pressureI = rhoI.sub(REST_DENSITY).max(0.0).mul(PRESSURE_STIFFNESS);
+
+    const force = vec3(0,0,0).toVar();
+    Loop(N_PARTICLES, ({i:j})=>{
+      If(uint(j).notEqual(i), ()=>{
+        const pj = tidePosNode.element(uint(j));
+        const vj = tideVelNode.element(uint(j));
+        const rhoJ = tideDensityNode.element(uint(j)).max(0.0001);
+        const diff = pi.sub(pj);
+        const dist = diff.length().max(0.0001);
+        If(dist.lessThan(float(SMOOTHING_RADIUS)), ()=>{
+          const dir = diff.div(dist);
+          const pressureJ = rhoJ.sub(REST_DENSITY).max(0.0).mul(PRESSURE_STIFFNESS);
+          const pressureForce = dir.mul(pressureI.add(pressureJ).mul(0.5).mul(spikyGrad(dist, float(SMOOTHING_RADIUS))).div(rhoJ));
+          force.subAssign(pressureForce);
+          force.addAssign(vj.sub(vi).mul(VISCOSITY).div(rhoJ));
+        });
+      });
+    });
+
+    const toCenter = pi.negate();
+    const distCenter = toCenter.length().max(0.01);
+    force.addAssign(toCenter.div(distCenter).mul(GRAVITY_STRENGTH));
+
+    const toMoon = moonPosUniform.sub(pi);
+    const distMoon = toMoon.length().max(0.01);
+    force.addAssign(toMoon.div(distMoon).mul(MOON_MASS_STRENGTH).div(distMoon.mul(distMoon)));
+
+    const dt = float(0.016);
+    const newVel = vi.add(force.mul(dt));
+    const newPos = pi.add(newVel.mul(dt));
+
+    const dir = tslNormalize(newPos);
+    const r = newPos.length();
+    const floorR = float(PLANET_RADIUS - 0.2);
+    const belowFloor = r.lessThan(floorR);
+    const correctedPos = mix(newPos, dir.mul(floorR), belowFloor);
+    const correctedVel = mix(newVel, newVel.sub(dir.mul(newVel.dot(dir)).mul(1.4)), belowFloor);
+
+    tidePosNode.element(i).assign(correctedPos);
+    tideVelNode.element(i).assign(correctedVel);
+  });
+
+  const tideDensityPass = tideComputeDensity().compute(N_PARTICLES);
+  const tideForcePass = tideComputeForces().compute(N_PARTICLES);
+
+  const tideParticleGeo = new THREE.BufferGeometry();
+  tideParticleGeo.setAttribute('position', tidePosBuf);
+  tideParticleGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0,0,0), PLANET_RADIUS*1.5);
+  const tideParticleMat = new THREE.PointsNodeMaterial({ color:0x3fa8d8, size:0.35, transparent:true, opacity:0.85 });
+  const tideParticles = new THREE.Points(tideParticleGeo, tideParticleMat);
+  scene.add(tideParticles);
+  moonMesh.visible = false; tideParticles.visible = false;
+  log('Tides: SPH ocean ('+N_PARTICLES+' particles) + orbiting moon added');
+
+
   // ── Tab switching: WALK uses the first-person character-controller
   // camera and (on touch devices) the joysticks/jump button; ORBIT uses
   // a free-flying OrbitControls camera pulled back far enough to see
-  // the whole planet, its atmosphere, and the starfield around it, with
-  // the touch controls hidden since they don't apply there. Both tabs
-  // render the exact same scene/materials - nothing about the terrain,
-  // water, or atmosphere shaders needs to know which camera is active.
+  // the whole planet, its atmosphere, and the starfield around it;
+  // TIDES swaps in the SPH ocean particles + orbiting moon in place of
+  // the smooth water sphere (showing both at once would be redundant -
+  // they're two different representations of "the ocean"). All three
+  // tabs render the exact same terrain/atmosphere - switching just
+  // changes which camera is active and which ocean representation (and,
+  // for TIDES, whether the fluid sim is actually being stepped - no
+  // sense spending compute on particles nobody's looking at).
   const walkOnlyEls = [document.getElementById('joy-move'), document.getElementById('joy-look'), document.getElementById('jump-btn')];
   function setTab(tab){
     currentTab = tab;
-    activeCamera = (tab==='walk') ? walkCamera : orbitCamera;
+    activeCamera = (tab==='walk') ? walkCamera : (tab==='orbit') ? orbitCamera : tidesCamera;
     document.getElementById('tab-walk-btn').classList.toggle('active', tab==='walk');
     document.getElementById('tab-orbit-btn').classList.toggle('active', tab==='orbit');
+    document.getElementById('tab-tides-btn').classList.toggle('active', tab==='tides');
     document.getElementById('hint').style.display = (tab==='walk') ? 'block' : 'none';
     document.getElementById('crosshair').style.display = (tab==='walk') ? 'block' : 'none';
     if(tab==='walk' && hasTouch){
@@ -711,15 +853,20 @@ try{
     } else {
       walkOnlyEls.forEach(el=>{ if(el) el.style.display = 'none'; });
     }
+    moonMesh.visible = (tab==='tides');
+    tideParticles.visible = (tab==='tides');
+    waterMesh.visible = (tab!=='tides');
   }
   document.getElementById('tab-walk-btn').addEventListener('click', ()=>setTab('walk'));
   document.getElementById('tab-orbit-btn').addEventListener('click', ()=>setTab('orbit'));
+  document.getElementById('tab-tides-btn').addEventListener('click', ()=>setTab('tides'));
   setTab('walk');
   log('READY');
 
   let last = performance.now();
   let frameCount=0, loggedFirst=false;
   let sunAngle = 0.6;
+  let moonAngle = 0.0;
   async function frame(){
     const now = performance.now();
     const dt = Math.min((now-last)/1000, 0.05);
@@ -728,8 +875,16 @@ try{
       if(currentTab==='walk'){
         updatePlayer(dt);
         updateCamera();
-      } else {
+      } else if(currentTab==='orbit'){
         orbitControls.update();
+      } else {
+        tidesControls.update();
+        moonAngle += dt*0.15; // faster than the terrain-demo's illustrative day/night cycle - this orbit is the whole point of this tab
+        const mx=Math.cos(moonAngle)*MOON_ORBIT_RADIUS, mz=Math.sin(moonAngle)*MOON_ORBIT_RADIUS;
+        moonMesh.position.set(mx, 8, mz);
+        moonPosUniform.value.set(mx, 8, mz);
+        await renderer.computeAsync(tideDensityPass);
+        await renderer.computeAsync(tideForcePass);
       }
       sunAngle += dt*0.04; // slow day/night cycle
       sun.position.set(Math.cos(sunAngle)*80, Math.sin(sunAngle)*80, 30);
@@ -738,16 +893,23 @@ try{
       const daylight = Math.max(0.15, Math.sin(sunAngle));
       sun.intensity = 1.0 + daylight*2.6;
 
-      // Independent depth pre-pass for the atmosphere: terrain only,
-      // water and atmosphere itself hidden, rendered into their own
+      // Independent depth pre-pass for the atmosphere: terrain only -
+      // water, atmosphere, the moon, and the tide particles are all
+      // hidden here regardless of tab (none of them count as "solid
+      // ground" for this calculation), rendered into their own
       // dedicated render target - never touches or is touched by the
-      // main pass's depth buffer that water reads from. Uses whichever
-      // camera is active for the current tab.
-      waterMesh.visible = false; atmoMesh.visible = false;
+      // main pass's depth buffer that water reads from. Real bug fixed
+      // here: this used to unconditionally restore waterMesh.visible to
+      // true afterward, which would have fought with the new TIDES tab
+      // (showing the smooth water sphere and the SPH particles at the
+      // same time) - visibility is now restored from setTab()'s actual
+      // per-tab state instead of a hardcoded value.
+      const wasWaterVisible = waterMesh.visible, wasMoonVisible = moonMesh.visible, wasParticlesVisible = tideParticles.visible;
+      waterMesh.visible = false; atmoMesh.visible = false; moonMesh.visible = false; tideParticles.visible = false;
       renderer.setRenderTarget(atmoDepthTarget);
       await renderer.renderAsync(scene, activeCamera);
       renderer.setRenderTarget(null);
-      waterMesh.visible = true; atmoMesh.visible = true;
+      waterMesh.visible = wasWaterVisible; atmoMesh.visible = true; moonMesh.visible = wasMoonVisible; tideParticles.visible = wasParticlesVisible;
 
       await renderer.renderAsync(scene, activeCamera);
       frameCount++;
@@ -764,6 +926,8 @@ try{
     walkCamera.updateProjectionMatrix();
     orbitCamera.aspect = window.innerWidth/window.innerHeight;
     orbitCamera.updateProjectionMatrix();
+    tidesCamera.aspect = window.innerWidth/window.innerHeight;
+    tidesCamera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
     atmoDepthTarget.setSize(window.innerWidth, window.innerHeight);
   });
