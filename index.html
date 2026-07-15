@@ -9,7 +9,12 @@
 #joy-look{right:24px;}
 .joy-stick{position:absolute;top:50%;left:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;background:rgba(255,255,255,0.35);border:1px solid rgba(255,255,255,0.5);pointer-events:none;}
 #jump-btn{position:fixed;right:28px;bottom:172px;width:64px;height:64px;border-radius:50%;background:rgba(120,255,160,0.18);border:1px solid rgba(150,255,180,0.5);color:#cfffdd;font-family:monospace;font-size:11px;z-index:20;touch-action:none;display:flex;align-items:center;justify-content:center;}
-@media (min-width:900px){ .joy-zone,#jump-btn{display:none;} }
+/* Real bug found: a min-width media query used screen width as a proxy
+   for "has keyboard/mouse" and hid these above 900px - but tablets in
+   landscape are routinely wider than that despite being touch-only,
+   which is exactly why they never appeared. Hidden by default here;
+   JS below shows them directly based on actual touch capability. */
+.joy-zone,#jump-btn{display:none;}
 </style>
 </head><body>
 <div id="info">loading...</div>
@@ -31,6 +36,14 @@ import {
 import { EdgeVertexIndices, EdgeMasks, TriangleTable } from './mc_tables.js';
 
 const info = document.getElementById('info');
+// Real touch-capability detection, not screen width - a tablet in
+// landscape can easily be wider than a "desktop" breakpoint.
+const hasTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+if(hasTouch){
+  document.getElementById('joy-move').style.display = 'block';
+  document.getElementById('joy-look').style.display = 'block';
+  document.getElementById('jump-btn').style.display = 'flex';
+}
 const log = (s)=>{ info.textContent += s + '\n'; console.log(s); };
 
 function hash3(x,y,z){ let h=Math.sin(x*127.1+y*311.7+z*74.7)*43758.5453123; return h-Math.floor(h); }
