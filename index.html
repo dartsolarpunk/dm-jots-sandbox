@@ -5,8 +5,8 @@
 #crosshair{position:fixed;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);z-index:9;pointer-events:none;}
 #hint{position:fixed;bottom:6px;left:6px;color:#9adba9;font-family:monospace;font-size:11px;z-index:10;pointer-events:none;}
 .joy-zone{position:fixed;bottom:24px;width:132px;height:132px;border-radius:50%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.25);z-index:20;touch-action:none;}
-#joy-move{left:24px;}
-#joy-look{right:24px;}
+#joy-look{left:24px;}
+#joy-move{right:24px;}
 .joy-stick{position:absolute;top:50%;left:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;background:rgba(255,255,255,0.35);border:1px solid rgba(255,255,255,0.5);pointer-events:none;}
 #jump-btn{position:fixed;right:28px;bottom:172px;width:64px;height:64px;border-radius:50%;background:rgba(120,255,160,0.18);border:1px solid rgba(150,255,180,0.5);color:#cfffdd;font-family:monospace;font-size:11px;z-index:20;touch-action:none;display:flex;align-items:center;justify-content:center;}
 /* Real bug found: a min-width media query used screen width as a proxy
@@ -19,7 +19,7 @@
 </head><body>
 <div id="info">loading...</div>
 <div id="crosshair"></div>
-<div id="hint">Keyboard: WASD move, mouse look, Space jump · Touch: joysticks + JUMP button</div>
+<div id="hint">Keyboard: WASD move, mouse look, Space jump · Touch: left=look, right=move+JUMP</div>
 <div class="joy-zone" id="joy-move"><div class="joy-stick" id="joy-move-stick"></div></div>
 <div class="joy-zone" id="joy-look"><div class="joy-stick" id="joy-look-stick"></div></div>
 <button id="jump-btn">JUMP</button>
@@ -322,18 +322,28 @@ try{
     zone.addEventListener('touchend', end, {passive:false});
     zone.addEventListener('touchcancel', end, {passive:false});
   }
-  setupJoystick('joy-move','joy-move-stick',
-    (nx,ny)=>{ joyMove.x=nx; joyMove.y=ny; },
-    ()=>{ joyMove.x=0; joyMove.y=0; });
   setupJoystick('joy-look','joy-look-stick',
     (nx,ny)=>{ joyLook.dx=nx; joyLook.dy=ny; },
     ()=>{ joyLook.dx=0; joyLook.dy=0; });
+  setupJoystick('joy-move','joy-move-stick',
+    (nx,ny)=>{ joyMove.x=nx; joyMove.y=ny; },
+    ()=>{ joyMove.x=0; joyMove.y=0; });
 
-  let jumpHeld = false;
+  // Real bug found: jumpHeld was set true on touchstart and false on
+  // touchend - a quick tap can fire both of those within the same
+  // ~16ms window between two animation frames, so updatePlayer() would
+  // never actually see it as true even though the tap clearly happened
+  // (this is exactly the "I'm tapping here but it's doing nothing" and
+  // the "jumping and stuttering" symptoms - the rare frame where it WAS
+  // seen as true could line up with a mid-air onGround flicker). Fixed
+  // with an edge-triggered queued flag: touchstart queues a jump,
+  // updatePlayer() consumes and clears it next frame regardless of how
+  // briefly the button was actually held.
+  let jumpQueued = false;
   const jumpBtn = document.getElementById('jump-btn');
-  jumpBtn.addEventListener('touchstart', e=>{ jumpHeld=true; e.preventDefault(); }, {passive:false});
-  jumpBtn.addEventListener('touchend', e=>{ jumpHeld=false; e.preventDefault(); }, {passive:false});
-  jumpBtn.addEventListener('touchcancel', ()=>{ jumpHeld=false; });
+  jumpBtn.addEventListener('touchstart', e=>{ jumpQueued=true; e.preventDefault(); }, {passive:false});
+  jumpBtn.addEventListener('touchend', e=>{ e.preventDefault(); }, {passive:false});
+  window.addEventListener('keydown', e=>{ if(e.code==='Space') jumpQueued=true; });
 
   const GRAVITY = 9.0;
   const MOVE_SPEED = 4.5;
@@ -368,7 +378,8 @@ try{
     player.vel.addScaledVector(tmpUp, -GRAVITY*dt);
     player.vel.copy(moveVec).addScaledVector(tmpUp, player.vel.dot(tmpUp));
 
-    if((keys['Space'] || jumpHeld) && player.onGround){
+    if(jumpQueued && player.onGround){
+      jumpQueued = false;
       player.vel.addScaledVector(tmpUp, JUMP_SPEED);
       player.onGround = false;
     }
