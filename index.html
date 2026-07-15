@@ -9,6 +9,11 @@
 #joy-move{right:24px;}
 .joy-stick{position:absolute;top:50%;left:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;background:rgba(255,255,255,0.35);border:1px solid rgba(255,255,255,0.5);pointer-events:none;}
 #jump-btn{position:fixed;right:28px;bottom:172px;width:64px;height:64px;border-radius:50%;background:rgba(120,255,160,0.18);border:1px solid rgba(150,255,180,0.5);color:#cfffdd;font-family:monospace;font-size:11px;z-index:20;touch-action:none;display:flex;align-items:center;justify-content:center;}
+#tab-header{position:fixed;top:0;left:0;right:0;height:44px;z-index:30;display:flex;background:rgba(8,9,16,0.88);border-bottom:1px solid rgba(150,170,255,0.25);backdrop-filter:blur(6px);}
+.tab-btn{flex:0 0 auto;padding:0 22px;height:100%;background:none;border:none;color:#7a86a8;font-family:monospace;font-size:13px;letter-spacing:0.04em;cursor:pointer;border-bottom:2px solid transparent;}
+.tab-btn.active{color:#cfe0ff;border-bottom:2px solid #7fb0ff;}
+.tab-btn:hover{color:#e0e8ff;}
+#info{top:50px;}
 /* Real bug found: a min-width media query used screen width as a proxy
    for "has keyboard/mouse" and hid these above 900px - but tablets in
    landscape are routinely wider than that despite being touch-only,
@@ -17,6 +22,10 @@
 .joy-zone,#jump-btn{display:none;}
 </style>
 </head><body>
+<div id="tab-header">
+  <button class="tab-btn active" id="tab-walk-btn">WALK (gamepad)</button>
+  <button class="tab-btn" id="tab-orbit-btn">ORBIT (view whole planet)</button>
+</div>
 <div id="info">loading...</div>
 <div id="crosshair"></div>
 <div id="hint">Keyboard: WASD move, mouse look, Space jump · Touch: left=look, right=move+JUMP · <a href="./planet.html" style="color:#9adba9;">cube-sphere LOD demo →</a></div>
@@ -28,6 +37,7 @@
 </script>
 <script type="module">
 import * as THREE from 'three';
+import { OrbitControls } from './OrbitControls.js';
 import {
   Fn, If, Loop, storage, instanceIndex, uint, int, float, vec3, vec4,
   select, mx_fractal_noise_float, mx_worley_noise_float, normalWorld, positionWorld, positionView,
@@ -133,7 +143,16 @@ try{
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x03040a);
-  const camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.05, 500);
+  const walkCamera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.05, 500);
+  const orbitCamera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.5, 2000);
+  orbitCamera.position.set(0, 60, 160);
+  const orbitControls = new OrbitControls(orbitCamera, renderer.domElement);
+  orbitControls.enableDamping = true;
+  orbitControls.minDistance = 40;
+  orbitControls.maxDistance = 700;
+  orbitControls.target.set(0,0,0);
+  let activeCamera = walkCamera;
+  let currentTab = 'walk';
 
   {
     const N=2000, pos=new Float32Array(N*3);
@@ -324,36 +343,67 @@ try{
   // shore = lighter/more see-through, deep = darker/more opaque),
   // shoreline foam (thickness near zero), and it's all recomputed live
   // if the terrain changes, no separate baked mask needed.
-  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+0.02, 96, 64);
+  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+0.02, 120, 80);
   const waterMat = new THREE.MeshStandardNodeMaterial({
-    transparent:true, side:THREE.DoubleSide, depthWrite:false, roughness:0.2, metalness:0.05,
+    transparent:true, side:THREE.DoubleSide, depthWrite:false, metalness:0.05,
   });
 
   const sceneDepth = viewportLinearDepth;
   const surfaceDepth = linearDepth(positionView.z);
   const depthDiff = sceneDepth.sub(surfaceDepth).max(0.0);
-  const depthFactor = depthDiff.mul(60.0).clamp(0.0, 1.0);
+  // Real bug found: this was scaled by 60x, which saturates the shallow-
+  // to-deep gradient almost immediately (a water column just 0.02 units
+  // thick already reads as maximally "deep") given this planet's terrain
+  // varies by only a couple of units - nearly everything looked like the
+  // same dark deep-water color instead of a real gradient. Terrain
+  // height variance here is roughly +/-2 units, so a water column is
+  // typically 0-2 units deep; scaling by ~3 keeps the visible shallow-
+  // to-deep transition spread across that actual range instead of
+  // collapsing it into the first few centimeters.
+  const depthFactor = depthDiff.mul(3.2).clamp(0.0, 1.0);
 
-  const shallowColor = vec3(0.30, 0.72, 0.68);
+  const shallowColor = vec3(0.34, 0.76, 0.72);
+  const midColor = vec3(0.10, 0.45, 0.52);
   const deepColor = vec3(0.02, 0.09, 0.20);
-  const baseColor = mix(shallowColor, deepColor, depthFactor);
+  const baseColor = mix(mix(shallowColor, midColor, smoothstep(0.0,0.45,depthFactor)), deepColor, smoothstep(0.35,1.0,depthFactor));
 
-  // Shoreline foam: a thin band where depth-into-water is near zero.
-  const foam = float(1.0).sub(smoothstep(0.0, 0.008, depthDiff));
+  // Shoreline foam: a thin band where depth-into-water is near zero,
+  // broken up with noise so it's not a uniform ring.
+  const foam = float(1.0).sub(smoothstep(0.0, 0.05, depthDiff));
   const foamNoise = mx_fractal_noise_float(positionWorld.mul(8.0).add(vec3(time.mul(0.3),0,time.mul(0.2))), 3, 2.0, 0.5);
-  const foamMask = foam.mul(smoothstep(0.15, 0.6, foamNoise.mul(0.5).add(0.5)).add(0.4).clamp(0.0,1.0));
+  const foamMask = foam.mul(smoothstep(0.15, 0.6, foamNoise.mul(0.5).add(0.5)).add(0.35).clamp(0.0,1.0));
 
-  waterMat.colorNode = mix(baseColor, vec3(1,1,1), foamMask);
-  waterMat.opacityNode = clamp(float(0.35).add(depthFactor.mul(0.55)).add(foamMask.mul(0.45)), 0.0, 0.96);
-
-  // Animated wave normal: perturbs the shading normal with time-scrolling
-  // noise so specular highlights break up into moving glints instead of
-  // one static mirror-like hotspot.
+  // Multi-octave wave normal: two large rolling-swell layers (as before)
+  // plus a third smaller/faster layer for fine ripple detail, so the
+  // surface reads as textured water rather than a smooth tinted glass
+  // sphere with one repeating bump frequency.
   const wavePos = positionWorld.mul(2.6).add(vec3(time.mul(0.15), 0.0, time.mul(0.11)));
   const waveN = mx_fractal_noise_float(wavePos, 4, 2.0, 0.5);
   const wavePos2 = positionWorld.mul(2.6).add(vec3(time.mul(0.11).add(50.0), 0.0, time.mul(-0.13)));
   const waveN2 = mx_fractal_noise_float(wavePos2, 4, 2.0, 0.5);
-  waterMat.normalNode = tslNormalize(normalWorld.add(vec3(waveN.mul(0.12), waveN2.mul(0.12), waveN.mul(waveN2).mul(0.08))));
+  const wavePos3 = positionWorld.mul(9.0).add(vec3(time.mul(0.4).add(12.0), 0.0, time.mul(0.33)));
+  const waveN3 = mx_fractal_noise_float(wavePos3, 2, 2.0, 0.5);
+  const waveNormal = tslNormalize(normalWorld.add(vec3(
+    waveN.mul(0.12).add(waveN3.mul(0.035)),
+    waveN2.mul(0.12).add(waveN3.mul(0.035)),
+    waveN.mul(waveN2).mul(0.08)
+  )));
+
+  // Fresnel-based shine at grazing angles - the actual "light breaking
+  // up unevenly across the surface, not one flat specular patch" effect
+  // described: combined with the wave-perturbed normal above, the angle
+  // (and therefore the brightness) varies continuously across the
+  // surface instead of being symmetrical.
+  const viewDirWater = positionWorld.sub(cameraPosition).normalize();
+  const fresnelWater = float(1.0).sub(viewDirWater.dot(waveNormal).abs()).pow(2.5);
+  const shine = fresnelWater.mul(0.55);
+
+  waterMat.colorNode = mix(baseColor, vec3(1,1,1), foamMask).add(vec3(0.55,0.65,0.75).mul(shine));
+  waterMat.opacityNode = clamp(float(0.4).add(depthFactor.mul(0.5)).add(foamMask.mul(0.4)).add(shine.mul(0.3)), 0.0, 0.97);
+  waterMat.normalNode = waveNormal;
+  // Roughness modulated by the same wave noise, so specular highlights
+  // themselves break up across the surface instead of one uniform shine.
+  waterMat.roughnessNode = clamp(float(0.06).add(waveN3.abs().mul(0.12)), 0.03, 0.28);
 
   const waterMesh = new THREE.Mesh(waterGeo, waterMat);
   scene.add(waterMesh);
@@ -619,18 +669,43 @@ try{
 
   function updateCamera(){
     const dir = player.pos.clone().normalize();
-    camera.position.copy(player.pos);
+    walkCamera.position.copy(player.pos);
     const worldFwdRef = Math.abs(dir.y) < 0.99 ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
     const right = new THREE.Vector3().crossVectors(worldFwdRef, dir).normalize();
     const fwd = new THREE.Vector3().crossVectors(dir, right).normalize();
     qYaw.setFromAxisAngle(dir, player.yaw);
     qPitch.setFromAxisAngle(right.clone().applyQuaternion(qYaw), player.pitch);
     const lookDir = fwd.clone().applyQuaternion(qYaw).applyQuaternion(qPitch);
-    camera.up.copy(dir);
-    camera.lookAt(camera.position.clone().add(lookDir));
+    walkCamera.up.copy(dir);
+    walkCamera.lookAt(walkCamera.position.clone().add(lookDir));
   }
 
   log('Character controller ready (small-planet walker)');
+
+  // ── Tab switching: WALK uses the first-person character-controller
+  // camera and (on touch devices) the joysticks/jump button; ORBIT uses
+  // a free-flying OrbitControls camera pulled back far enough to see
+  // the whole planet, its atmosphere, and the starfield around it, with
+  // the touch controls hidden since they don't apply there. Both tabs
+  // render the exact same scene/materials - nothing about the terrain,
+  // water, or atmosphere shaders needs to know which camera is active.
+  const walkOnlyEls = [document.getElementById('joy-move'), document.getElementById('joy-look'), document.getElementById('jump-btn')];
+  function setTab(tab){
+    currentTab = tab;
+    activeCamera = (tab==='walk') ? walkCamera : orbitCamera;
+    document.getElementById('tab-walk-btn').classList.toggle('active', tab==='walk');
+    document.getElementById('tab-orbit-btn').classList.toggle('active', tab==='orbit');
+    document.getElementById('hint').style.display = (tab==='walk') ? 'block' : 'none';
+    document.getElementById('crosshair').style.display = (tab==='walk') ? 'block' : 'none';
+    if(tab==='walk' && hasTouch){
+      walkOnlyEls.forEach(el=>{ if(el) el.style.display = (el.id==='jump-btn') ? 'flex' : 'block'; });
+    } else {
+      walkOnlyEls.forEach(el=>{ if(el) el.style.display = 'none'; });
+    }
+  }
+  document.getElementById('tab-walk-btn').addEventListener('click', ()=>setTab('walk'));
+  document.getElementById('tab-orbit-btn').addEventListener('click', ()=>setTab('orbit'));
+  setTab('walk');
   log('READY');
 
   let last = performance.now();
@@ -641,8 +716,12 @@ try{
     const dt = Math.min((now-last)/1000, 0.05);
     last = now;
     try{
-      updatePlayer(dt);
-      updateCamera();
+      if(currentTab==='walk'){
+        updatePlayer(dt);
+        updateCamera();
+      } else {
+        orbitControls.update();
+      }
       sunAngle += dt*0.04; // slow day/night cycle
       sun.position.set(Math.cos(sunAngle)*80, Math.sin(sunAngle)*80, 30);
       sunDirUniform.value.copy(sun.position).normalize();
@@ -652,14 +731,15 @@ try{
       // Independent depth pre-pass for the atmosphere: terrain only,
       // water and atmosphere itself hidden, rendered into their own
       // dedicated render target - never touches or is touched by the
-      // main pass's depth buffer that water reads from.
+      // main pass's depth buffer that water reads from. Uses whichever
+      // camera is active for the current tab.
       waterMesh.visible = false; atmoMesh.visible = false;
       renderer.setRenderTarget(atmoDepthTarget);
-      await renderer.renderAsync(scene, camera);
+      await renderer.renderAsync(scene, activeCamera);
       renderer.setRenderTarget(null);
       waterMesh.visible = true; atmoMesh.visible = true;
 
-      await renderer.renderAsync(scene, camera);
+      await renderer.renderAsync(scene, activeCamera);
       frameCount++;
       if(!loggedFirst){ loggedFirst=true; log('First frame rendered without error'); }
     }catch(e){
@@ -668,6 +748,15 @@ try{
     requestAnimationFrame(frame);
   }
   frame();
+
+  window.addEventListener('resize', ()=>{
+    walkCamera.aspect = window.innerWidth/window.innerHeight;
+    walkCamera.updateProjectionMatrix();
+    orbitCamera.aspect = window.innerWidth/window.innerHeight;
+    orbitCamera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    atmoDepthTarget.setSize(window.innerWidth, window.innerHeight);
+  });
 }catch(e){
   log('ERROR: '+e.message+'\n'+e.stack);
 }
