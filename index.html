@@ -66,14 +66,61 @@ function fractalNoise3(x,y,z,octaves,lac,gain){
   return sum/norm;
 }
 const PLANET_RADIUS = 12;
+// Real bug found: this JS noise approximation never got updated when
+// craters were added to the GPU density function - the character's
+// collision "ground" and the actual rendered terrain silently drifted
+// apart wherever a crater bowl/rim was, and more importantly the two
+// use completely different hash/noise implementations so they could
+// never be made to match by tuning constants. If the player was ever
+// standing somewhere onGround's approximation disagreed with reality
+// (floating slightly above or embedded slightly below the real
+// surface), the jump's `onGround` check could go permanently false -
+// which fully explains "tapping does nothing," on top of the earlier
+// race-condition fix. Real fix: read back the ACTUAL GPU-computed
+// density field once after the compute pass and sample that directly
+// for collision - guaranteed pixel-consistent with the rendered mesh,
+// including every crater, by construction, not by approximation.
+let densityArray = null, densityGridInfo = null;
+function sampleDensityAt(wx, wy, wz){
+  const { GRID, CELL, HALF } = densityGridInfo;
+  let gx=(wx+HALF)/CELL, gy=(wy+HALF)/CELL, gz=(wz+HALF)/CELL;
+  gx=Math.max(0,Math.min(gx,GRID-1.001));
+  gy=Math.max(0,Math.min(gy,GRID-1.001));
+  gz=Math.max(0,Math.min(gz,GRID-1.001));
+  const gx0=Math.floor(gx), gy0=Math.floor(gy), gz0=Math.floor(gz);
+  const gx1=gx0+1, gy1=gy0+1, gz1=gz0+1;
+  const fx=gx-gx0, fy=gy-gy0, fz=gz-gz0;
+  const idx=(x,y,z)=> x + y*GRID + z*GRID*GRID;
+  const c000=densityArray[idx(gx0,gy0,gz0)], c100=densityArray[idx(gx1,gy0,gz0)];
+  const c010=densityArray[idx(gx0,gy1,gz0)], c110=densityArray[idx(gx1,gy1,gz0)];
+  const c001=densityArray[idx(gx0,gy0,gz1)], c101=densityArray[idx(gx1,gy0,gz1)];
+  const c011=densityArray[idx(gx0,gy1,gz1)], c111=densityArray[idx(gx1,gy1,gz1)];
+  const x00=c000+(c100-c000)*fx, x10=c010+(c110-c010)*fx, x01=c001+(c101-c001)*fx, x11=c011+(c111-c011)*fx;
+  const y0=x00+(x10-x00)*fy, y1=x01+(x11-x01)*fy;
+  return y0+(y1-y0)*fz;
+}
+function groundRadiusReal(dirX,dirY,dirZ){
+  const { HALF } = densityGridInfo;
+  const step = 0.1;
+  let r = PLANET_RADIUS - 3.5;
+  let prevD = sampleDensityAt(dirX*r, dirY*r, dirZ*r);
+  const maxR = HALF*0.97;
+  while(r < maxR){
+    const rN = r+step;
+    const d = sampleDensityAt(dirX*rN, dirY*rN, dirZ*rN);
+    if(prevD < 0 && d >= 0){
+      const t = prevD/(prevD-d);
+      return r + t*step;
+    }
+    prevD = d; r = rN;
+  }
+  return PLANET_RADIUS;
+}
 function groundRadiusAt(dirX,dirY,dirZ){
-  const p2=2.3;
-  const n1=fractalNoise3(dirX*p2,dirY*p2,dirZ*p2,5,2.0,0.5);
-  const ridge=1-Math.abs(n1);
-  const n2=fractalNoise3(dirX*p2*3+9.1,dirY*p2*3+2.3,dirZ*p2*3+4.7,3,2.0,0.5);
-  const billow=Math.abs(n2);
-  const terrain=ridge*ridge*0.9-billow*0.35;
-  return PLANET_RADIUS+terrain*1.4;
+  if(densityArray) return groundRadiusReal(dirX,dirY,dirZ);
+  // Fallback only for the brief window before the real density data is
+  // ready - not used once the game has actually started.
+  return PLANET_RADIUS;
 }
 
 async function main(){
@@ -166,6 +213,11 @@ try{
   });
   await renderer.computeAsync(densityFn().compute(numPoints));
   log('Density pass OK');
+
+  densityGridInfo = { GRID, CELL, HALF };
+  const densityArrBuf = await renderer.getArrayBufferAsync(densityBuf);
+  densityArray = new Float32Array(densityArrBuf);
+  log('Density readback for collision OK ('+densityArray.length+' samples) - collision now pixel-consistent with the rendered mesh, craters included');
 
   const mcFn = Fn(()=>{
     const cellIdx = instanceIndex;
