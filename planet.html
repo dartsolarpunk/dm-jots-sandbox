@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;background:#05070d;overflow:hidden;height:100%;}
+#info{position:fixed;top:4px;left:4px;color:#7CFC7C;font-family:monospace;font-size:11px;white-space:pre;z-index:10;pointer-events:none;}
+#hint{position:fixed;bottom:6px;left:6px;color:#9adba9;font-family:monospace;font-size:11px;z-index:10;}
+</style>
+</head><body>
+<div id="info">loading...</div>
+<div id="hint">Drag to orbit · scroll to zoom in/out (watch LOD subdivide as you approach) · <a href="./index.html" style="color:#9adba9;">← back to marching-cubes terrain demo</a></div>
+<script>
+window.addEventListener('error', e=>{
+  document.getElementById('info').textContent += '\nWINDOW ERROR: '+e.message+' @ '+e.filename+':'+e.lineno;
+});
+window.addEventListener('unhandledrejection', e=>{
+  document.getElementById('info').textContent += '\nUNHANDLED REJECTION: '+e.reason;
+});
+</script>
+<script type="importmap">
+{ "imports": { "three": "./three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './OrbitControls.js';
+
+const info = document.getElementById('info');
+const log = (s)=>{ info.textContent += s + '\n'; console.log(s); };
+
+// ── Noise (matches the marching-cubes demo's terrain character:
+// ridge/billow height + Worley craters) so this looks like the same
+// planet family, just built via a completely different technique
+// (CPU heightmap mesh instead of GPU volumetric marching cubes). ──
+function hash3(x,y,z){ let h=Math.sin(x*127.1+y*311.7+z*74.7)*43758.5453123; return h-Math.floor(h); }
+function valueNoise3(x,y,z){
+  const xi=Math.floor(x),yi=Math.floor(y),zi=Math.floor(z);
+  const xf=x-xi,yf=y-yi,zf=z-zi;
+  const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf),w=zf*zf*(3-2*zf);
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const c000=hash3(xi,yi,zi),c100=hash3(xi+1,yi,zi),c010=hash3(xi,yi+1,zi),c110=hash3(xi+1,yi+1,zi);
+  const c001=hash3(xi,yi,zi+1),c101=hash3(xi+1,yi,zi+1),c011=hash3(xi,yi+1,zi+1),c111=hash3(xi+1,yi+1,zi+1);
+  const x00=lerp(c000,c100,u),x10=lerp(c010,c110,u),x01=lerp(c001,c101,u),x11=lerp(c011,c111,u);
+  const y0=lerp(x00,x10,v),y1=lerp(x01,x11,v);
+  return lerp(y0,y1,w)*2-1;
+}
+function fractalNoise3(x,y,z,octaves,lac,gain){
+  let amp=1,freq=1,sum=0,norm=0;
+  for(let i=0;i<octaves;i++){ sum+=valueNoise3(x*freq,y*freq,z*freq)*amp; norm+=amp; amp*=gain; freq*=lac; }
+  return sum/norm;
+}
+// Simple JS Worley (cellular) noise: distance from p to the nearest of
+// several jittered feature points in its own and neighboring grid cells.
+function worley3(x,y,z, cellSize){
+  const gx=Math.floor(x/cellSize), gy=Math.floor(y/cellSize), gz=Math.floor(z/cellSize);
+  let minD = 1e9;
+  for(let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++) for(let dz=-1;dz<=1;dz++){
+    const cx=gx+dx, cy=gy+dy, cz=gz+dz;
+    const jx = hash3(cx*3.1,cy*7.7,cz*2.3), jy = hash3(cx*5.9,cy*1.3,cz*8.1), jz = hash3(cx*2.7,cy*9.1,cz*4.7);
+    const fx=(cx+jx)*cellSize, fy=(cy+jy)*cellSize, fz=(cz+jz)*cellSize;
+    const d = Math.hypot(x-fx,y-fy,z-fz);
+    if(d<minD) minD=d;
+  }
+  return minD/cellSize;
+}
+
+const PLANET_RADIUS = 12;
+function groundRadiusAt(dirX,dirY,dirZ){
+  const p2=2.3;
+  const n1=fractalNoise3(dirX*p2,dirY*p2,dirZ*p2,5,2.0,0.5);
+  const ridge=1-Math.abs(n1);
+  const n2=fractalNoise3(dirX*p2*3+9.1,dirY*p2*3+2.3,dirZ*p2*3+4.7,3,2.0,0.5);
+  const billow=Math.abs(n2);
+  const terrain=ridge*ridge*0.9-billow*0.35;
+
+  const w1 = worley3(dirX*4.2,dirY*4.2,dirZ*4.2, 1.0);
+  const profile1 = Math.exp(-w1*w1*10);
+  const w2 = worley3(dirX*1.6+31,dirY*1.6+7,dirZ*1.6+19, 1.0);
+  const profile2 = Math.exp(-w2*w2*16);
+  const bowl = profile1*0.22 + profile2*0.55;
+
+  return PLANET_RADIUS + terrain*1.4 + bowl;
+}
+function biomeColor(dirX,dirY,dirZ,height,slope){
+  const rock=[0.42,0.38,0.34], sand=[0.76,0.68,0.48], grass=[0.28,0.46,0.22], snow=[0.92,0.94,0.97];
+  const mix=(a,b,t)=>{t=Math.max(0,Math.min(1,t));return [a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];};
+  let c = mix(sand,grass,(height+0.3)/0.6);
+  const slopeT = Math.max(0,Math.min(1,(slope-0.35)/0.4));
+  c = mix(c,rock,slopeT*slopeT*(3-2*slopeT));
+  c = mix(c,snow,(height-0.65)/0.3);
+  return c;
+}
+
+async function main(){
+try{
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+  document.body.appendChild(renderer.domElement);
+  log('WebGL renderer OK');
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x03040a);
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.05, 2000);
+  camera.position.set(0, 8, 42);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.minDistance = PLANET_RADIUS*1.02;
+  controls.maxDistance = 400;
+
+  {
+    const N=3000, pos=new Float32Array(N*3);
+    for(let i=0;i<N;i++){
+      const r=250+Math.random()*80, th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1);
+      pos[i*3]=r*Math.sin(ph)*Math.cos(th); pos[i*3+1]=r*Math.sin(ph)*Math.sin(th); pos[i*3+2]=r*Math.cos(ph);
+    }
+    const g=new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    scene.add(new THREE.Points(g, new THREE.PointsMaterial({size:0.7,color:0xffffff})));
+  }
+
+  const sun = new THREE.DirectionalLight(0xfff2e0, 2.4);
+  sun.position.set(60,40,30);
+  scene.add(sun);
+  scene.add(new THREE.AmbientLight(0x304050, 0.6));
+
+  // ── Cube-sphere quadtree ──────────────────────────────────────────
+  // Six root faces (up-axis + two tangent axes), each recursively
+  // subdivided based on camera distance relative to patch size - the
+  // same technique (and the same overall shape/reason) as the
+  // reference repo, rebuilt from scratch here in Three.js/WebGL rather
+  // than ported from Unity C#.
+  const FACES = [
+    { up:new THREE.Vector3(1,0,0),  a:new THREE.Vector3(0,1,0), b:new THREE.Vector3(0,0,1) },
+    { up:new THREE.Vector3(-1,0,0), a:new THREE.Vector3(0,1,0), b:new THREE.Vector3(0,0,-1) },
+    { up:new THREE.Vector3(0,1,0),  a:new THREE.Vector3(0,0,1), b:new THREE.Vector3(1,0,0) },
+    { up:new THREE.Vector3(0,-1,0), a:new THREE.Vector3(0,0,-1),b:new THREE.Vector3(1,0,0) },
+    { up:new THREE.Vector3(0,0,1),  a:new THREE.Vector3(1,0,0), b:new THREE.Vector3(0,1,0) },
+    { up:new THREE.Vector3(0,0,-1), a:new THREE.Vector3(-1,0,0),b:new THREE.Vector3(0,1,0) },
+  ];
+  const RES = 10; // quads per patch edge (11x11 verts) - modest, keeps CPU generation cheap
+  const MAX_DEPTH = 6;
+  const SPLIT_FACTOR = 1.9; // smaller = more aggressive subdivision
+
+  const planetGroup = new THREE.Group();
+  scene.add(planetGroup);
+  const material = new THREE.MeshStandardMaterial({ vertexColors:true, roughness:0.92, metalness:0.02 });
+
+  function cubeToSphereDir(up, a, b, ca, cb){
+    // ca, cb in [-1,1]. Standard (simple, some distortion at corners -
+    // matches the reference's approach; a perfect equal-area warp is a
+    // further refinement, not essential to a working LOD system).
+    const p = new THREE.Vector3()
+      .addScaledVector(up, 1)
+      .addScaledVector(a, ca)
+      .addScaledVector(b, cb);
+    return p.normalize();
+  }
+
+  function makePatchGeometry(face, centerA, centerB, size){
+    const verts = [];
+    const colors = [];
+    const res1 = RES+1;
+    const dirs = [];
+    for(let j=0;j<=RES;j++){
+      for(let i=0;i<=RES;i++){
+        const ca = centerA + (i/RES - 0.5)*size;
+        const cb = centerB + (j/RES - 0.5)*size;
+        const dir = cubeToSphereDir(face.up, face.a, face.b, ca, cb);
+        dirs.push(dir);
+        const r = groundRadiusAt(dir.x, dir.y, dir.z);
+        verts.push(dir.x*r, dir.y*r, dir.z*r);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    const posAttr = new Float32Array(verts);
+    geo.setAttribute('position', new THREE.BufferAttribute(posAttr,3));
+
+    const idx = [];
+    for(let j=0;j<RES;j++){
+      for(let i=0;i<RES;i++){
+        const a0=j*res1+i, a1=a0+1, a2=a0+res1, a3=a2+1;
+        idx.push(a0,a2,a1, a1,a2,a3);
+      }
+    }
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+
+    // Biome color per vertex, using height + slope (from the computed normal).
+    const normalAttr = geo.getAttribute('normal');
+    const col = new Float32Array((RES+1)*(RES+1)*3);
+    for(let k=0;k<dirs.length;k++){
+      const dir = dirs[k];
+      const r = Math.hypot(posAttr[k*3],posAttr[k*3+1],posAttr[k*3+2]);
+      const height = r - PLANET_RADIUS;
+      const nx=normalAttr.getX(k), ny=normalAttr.getY(k), nz=normalAttr.getZ(k);
+      const slope = 1 - Math.max(0,Math.min(1, nx*dir.x+ny*dir.y+nz*dir.z));
+      const c = biomeColor(dir.x,dir.y,dir.z,height,slope);
+      col[k*3]=c[0]; col[k*3+1]=c[1]; col[k*3+2]=c[2];
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    return geo;
+  }
+
+  function newNode(face, centerA, centerB, size, depth){
+    return { face, centerA, centerB, size, depth, mesh:null, children:null };
+  }
+
+  function nodeWorldCenter(node){
+    const dir = cubeToSphereDir(node.face.up, node.face.a, node.face.b, node.centerA, node.centerB);
+    const r = groundRadiusAt(dir.x,dir.y,dir.z);
+    return dir.multiplyScalar(r);
+  }
+
+  function ensureLeafMesh(node){
+    if(node.mesh) return;
+    const geo = makePatchGeometry(node.face, node.centerA, node.centerB, node.size);
+    node.mesh = new THREE.Mesh(geo, material);
+    planetGroup.add(node.mesh);
+  }
+  function disposeLeafMesh(node){
+    if(!node.mesh) return;
+    planetGroup.remove(node.mesh);
+    node.mesh.geometry.dispose();
+    node.mesh = null;
+  }
+  function makeChildren(node){
+    const half = node.size/2, quarter = node.size/4;
+    node.children = [
+      newNode(node.face, node.centerA-quarter, node.centerB-quarter, half, node.depth+1),
+      newNode(node.face, node.centerA+quarter, node.centerB-quarter, half, node.depth+1),
+      newNode(node.face, node.centerA-quarter, node.centerB+quarter, half, node.depth+1),
+      newNode(node.face, node.centerA+quarter, node.centerB+quarter, half, node.depth+1),
+    ];
+  }
+
+  let leafCount=0, triCount=0;
+  function updateNode(node, camPos){
+    const worldCenter = nodeWorldCenter(node);
+    const dist = worldCenter.distanceTo(camPos);
+    const shouldSplit = (dist < node.size * SPLIT_FACTOR * PLANET_RADIUS) && node.depth < MAX_DEPTH;
+
+    if(shouldSplit){
+      disposeLeafMesh(node);
+      if(!node.children) makeChildren(node);
+      for(const c of node.children) updateNode(c, camPos);
+    } else {
+      if(node.children){
+        for(const c of node.children){ disposeLeafMesh(c); if(c.children){ for(const cc of c.children) disposeLeafMesh(cc); } }
+        node.children = null;
+      }
+      ensureLeafMesh(node);
+      leafCount++; triCount += RES*RES*2;
+    }
+  }
+
+  const roots = FACES.map(f => newNode(f, 0, 0, 2, 0));
+  function rebuildQuadtree(){
+    leafCount=0; triCount=0;
+    for(const r of roots) updateNode(r, camera.position);
+  }
+  rebuildQuadtree();
+  log('Cube-sphere built: '+leafCount+' leaf patches, ~'+triCount+' triangles');
+  log('READY - orbit/zoom to see LOD subdivide');
+
+  let frame=0;
+  function animate(){
+    requestAnimationFrame(animate);
+    controls.update();
+    frame++;
+    if(frame % 15 === 0) rebuildQuadtree(); // periodic re-check, not every frame (CPU cost)
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  window.addEventListener('resize', ()=>{
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  window.__ready = true;
+}catch(e){
+  log('ERROR: '+e.message+'\n'+e.stack);
+  window.__ready = false;
+}
+}
+main();
+</script>
+</body></html>
