@@ -359,41 +359,125 @@ try{
   scene.add(waterMesh);
   log('Water sphere added (depth-aware, animated waves, shoreline foam)');
 
-  // ── Atmosphere: independent depth pass. Per the description of the
-  // reference approach - atmosphere fog/horizon shouldn't be computed
-  // from the same depth buffer the water pass uses (even though in
-  // practice water's depthWrite:false means it wouldn't actually
-  // interfere here, a genuinely separate pass makes that true by
-  // construction rather than by a detail of write-mask settings that
-  // could silently break if either material changes later). This
-  // render target + its own dedicated pre-pass render call exists only
-  // for the atmosphere to sample - completely decoupled from the main
-  // pass's own depth buffer that water reads via viewportLinearDepth.
+  // ── Atmosphere: real ray-marched Rayleigh scattering, per the
+  // confirmed technique from the reference video - not a Fresnel-glow
+  // approximation. For each atmosphere-shell fragment: march a primary
+  // ray from the camera through the atmosphere (stopping at either the
+  // outer atmosphere boundary or the planet's actual surface, found via
+  // an independent depth pre-pass); at each sample point along that
+  // ray, march a SECOND ray toward the sun to find how much atmosphere
+  // sunlight already passed through to reach that point (its optical
+  // depth). Density falls off exponentially with altitude. Per-
+  // wavelength scattering strength is proportional to 1/wavelength^4
+  // (real Rayleigh scattering physics - why the sky is blue and sunsets
+  // are red: shorter wavelengths scatter far more than longer ones),
+  // and light accumulates along the view ray weighted by how much has
+  // already been extinguished (transmittance) up to that point.
   const atmoDepthTarget = new THREE.RenderTarget(window.innerWidth, window.innerHeight);
   atmoDepthTarget.depthTexture = new THREE.DepthTexture();
   atmoDepthTarget.depthTexture.type = THREE.FloatType;
 
-  const atmoGeo = new THREE.SphereGeometry(HALF*1.02, 48, 32);
+  const ATMO_RADIUS = HALF*1.06;
+  const DENSITY_FALLOFF = 5.5;
+  const VIEW_SAMPLES = 10;
+  const SUN_SAMPLES = 5;
+  // Wavelengths in nm -> scattering coefficient per channel, following
+  // 1/wavelength^4 (real red/green/blue ~700/530/440nm), scaled by
+  // /400 first per the reference so the numbers land somewhere
+  // workable instead of a tiny fraction, then a tunable strength.
+  const wl = (nm)=> Math.pow(400/nm, 4);
+  const SCATTER_STRENGTH = 2.2;
+  const scatterCoeffsVal = new THREE.Vector3(wl(700), wl(530), wl(440)).multiplyScalar(SCATTER_STRENGTH);
+  const scatterCoeffs = uniform(scatterCoeffsVal);
+
+  // The sun's current world-space direction, refreshed every frame from
+  // the animated DirectionalLight - a uniform, not baked into the graph,
+  // since the sun actually moves (day/night cycle).
+  const sunDirUniform = uniform(new THREE.Vector3(1,0,0));
+
+  // Ray-sphere intersection: returns vec3(distToSphere, distThroughSphere,
+  // hitFlag). hitFlag is 0 if the ray misses the sphere entirely.
+  const raySphere = Fn(([sphereCenter, sphereRadius, rayOrigin, rayDir])=>{
+    const offset = rayOrigin.sub(sphereCenter);
+    const b = offset.dot(rayDir).mul(2.0);
+    const c = offset.dot(offset).sub(sphereRadius.mul(sphereRadius));
+    const disc = b.mul(b).sub(c.mul(4.0));
+    const result = vec3(0,0,0).toVar();
+    If(disc.greaterThanEqual(0.0), ()=>{
+      const s = disc.sqrt();
+      const near = b.negate().sub(s).div(2.0);
+      const far = b.negate().add(s).div(2.0);
+      If(far.greaterThanEqual(0.0), ()=>{
+        const dToSphere = near.max(0.0);
+        result.assign(vec3(dToSphere, far.sub(dToSphere), 1.0));
+      });
+    });
+    return result;
+  });
+
+  const densityAtPoint = Fn(([samplePoint])=>{
+    const height = samplePoint.length().sub(PLANET_RADIUS);
+    const h01 = height.div(ATMO_RADIUS-PLANET_RADIUS).clamp(0.0,1.0);
+    return exp(h01.negate().mul(DENSITY_FALLOFF)).mul(float(1.0).sub(h01));
+  });
+
+  const opticalDepth = Fn(([rayOrigin, rayDir, rayLength])=>{
+    const stepSize = rayLength.div(SUN_SAMPLES);
+    const p = rayOrigin.toVar();
+    const total = float(0).toVar();
+    Loop(SUN_SAMPLES, ()=>{
+      total.addAssign(densityAtPoint(p).mul(stepSize));
+      p.addAssign(rayDir.mul(stepSize));
+    });
+    return total;
+  });
+
   const atmoMat = new THREE.MeshBasicNodeMaterial({ transparent:true, side:THREE.BackSide, depthWrite:false, blending:THREE.AdditiveBlending });
-  const viewDir = positionWorld.sub(cameraPosition).normalize();
-  const fresnel = float(1.0).sub(viewDir.dot(normalWorld).abs()).pow(3.0);
 
-  // Sample the atmosphere's OWN depth texture (not the shared scene
-  // depth water uses) to find how far away whatever's behind this sky
-  // pixel actually is - terrain close by (near the horizon/ground)
-  // gets thicker fog; open sky (nothing in the depth pre-pass, reads
-  // as far-plane) gets the plain Fresnel glow with no added fog.
-  const atmoDepthNode = texture(atmoDepthTarget.depthTexture, screenUV);
-  const atmoViewZ = perspectiveDepthToViewZ(atmoDepthNode.r, cameraNear, cameraFar);
-  const myViewZ = positionView.z;
-  const distThroughAtmo = atmoViewZ.sub(myViewZ).abs().clamp(0.0, 40.0).div(40.0);
-  const horizonFog = smoothstep(0.0, 0.5, distThroughAtmo);
+  const atmosphereFn = Fn(()=>{
+    const camRayOrigin = cameraPosition;
+    const rayDirAtmo = positionWorld.sub(cameraPosition).normalize();
+    const planetCenter = vec3(0,0,0);
+    const hit = raySphere(planetCenter, float(ATMO_RADIUS), camRayOrigin, rayDirAtmo);
 
-  atmoMat.colorNode = mix(vec3(0.4,0.65,1.0).mul(fresnel).mul(1.4), vec3(0.75,0.82,0.95), horizonFog.mul(fresnel));
-  atmoMat.opacityNode = clamp(fresnel.add(horizonFog.mul(fresnel).mul(0.6)), 0.0, 1.0);
+    // How far along this ray the real planet surface is, from the
+    // independent depth pre-pass - the primary march must stop there
+    // rather than continuing through solid ground.
+    const atmoDepthNode = texture(atmoDepthTarget.depthTexture, screenUV);
+    const surfaceViewZ = perspectiveDepthToViewZ(atmoDepthNode.r, cameraNear, cameraFar);
+    const surfaceDist = surfaceViewZ.negate();
+
+    const marchStart = hit.x;
+    const marchLen = hit.y.min(surfaceDist.sub(marchStart).max(0.0));
+
+    const inScatter = vec3(0,0,0).toVar();
+    If(hit.z.greaterThan(0.5), ()=>{
+      const stepSize = marchLen.div(VIEW_SAMPLES);
+      const p = camRayOrigin.add(rayDirAtmo.mul(marchStart)).toVar();
+      const viewOpticalDepth = float(0).toVar();
+      Loop(VIEW_SAMPLES, ()=>{
+        const localDensity = densityAtPoint(p);
+        viewOpticalDepth.addAssign(localDensity.mul(stepSize));
+
+        // Sun ray from this sample point out to the atmosphere edge.
+        const sunHit = raySphere(planetCenter, float(ATMO_RADIUS), p, sunDirUniform);
+        const sunOpticalDepth = opticalDepth(p, sunDirUniform, sunHit.y);
+
+        const transmittance = exp(scatterCoeffs.negate().mul(sunOpticalDepth.add(viewOpticalDepth)));
+        inScatter.addAssign(localDensity.mul(transmittance).mul(scatterCoeffs).mul(stepSize));
+        p.addAssign(rayDirAtmo.mul(stepSize));
+      });
+    });
+    return inScatter;
+  });
+
+  const atmoInScatter = atmosphereFn();
+  atmoMat.colorNode = atmoInScatter;
+  atmoMat.opacityNode = clamp(atmoInScatter.r.add(atmoInScatter.g).add(atmoInScatter.b).mul(0.6), 0.0, 1.0);
+  const atmoGeo = new THREE.SphereGeometry(ATMO_RADIUS, 64, 40);
   const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
   scene.add(atmoMesh);
-  log('Atmosphere shell added (independent depth pass for horizon fog)');
+  log('Atmosphere shell added (real ray-marched Rayleigh scattering, '+VIEW_SAMPLES+'x'+SUN_SAMPLES+' samples)');
 
   const startDir = new THREE.Vector3(0.3,0.85,0.3).normalize();
   const player = {
@@ -561,6 +645,7 @@ try{
       updateCamera();
       sunAngle += dt*0.04; // slow day/night cycle
       sun.position.set(Math.cos(sunAngle)*80, Math.sin(sunAngle)*80, 30);
+      sunDirUniform.value.copy(sun.position).normalize();
       const daylight = Math.max(0.15, Math.sin(sunAngle));
       sun.intensity = 1.0 + daylight*2.6;
 
