@@ -416,6 +416,7 @@ try{
   waterMat.roughnessNode = clamp(float(0.06).add(waveN3.abs().mul(0.12)), 0.03, 0.28);
 
   const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+  waterMesh.renderOrder = 1;
   scene.add(waterMesh);
   log('Water sphere added (depth-aware, animated waves, shoreline foam)');
 
@@ -493,7 +494,7 @@ try{
     return total;
   });
 
-  const atmoMat = new THREE.MeshBasicNodeMaterial({ transparent:true, side:THREE.BackSide, depthWrite:false, blending:THREE.AdditiveBlending });
+  const atmoMat = new THREE.MeshBasicNodeMaterial({ transparent:true, side:THREE.BackSide, depthWrite:false, depthTest:false, blending:THREE.AdditiveBlending });
 
   const atmosphereFn = Fn(()=>{
     const camRayOrigin = cameraPosition;
@@ -545,6 +546,7 @@ try{
   atmoMat.opacityNode = clamp(atmoInScatter.r.add(atmoInScatter.g).add(atmoInScatter.b).mul(0.6), 0.0, 1.0);
   const atmoGeo = new THREE.SphereGeometry(ATMO_RADIUS, 64, 40);
   const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
+  atmoMesh.renderOrder = 2;
   scene.add(atmoMesh);
   log('Atmosphere shell added (real ray-marched Rayleigh scattering, '+VIEW_SAMPLES+'x'+SUN_SAMPLES+' samples)');
 
