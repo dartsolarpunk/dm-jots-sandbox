@@ -4,11 +4,20 @@
 #info{position:fixed;top:4px;left:4px;color:#7CFC7C;font-family:monospace;font-size:10px;white-space:pre;z-index:10;pointer-events:none;max-width:90vw;}
 #crosshair{position:fixed;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);z-index:9;pointer-events:none;}
 #hint{position:fixed;bottom:6px;left:6px;color:#9adba9;font-family:monospace;font-size:11px;z-index:10;pointer-events:none;}
+.joy-zone{position:fixed;bottom:24px;width:132px;height:132px;border-radius:50%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.25);z-index:20;touch-action:none;}
+#joy-move{left:24px;}
+#joy-look{right:24px;}
+.joy-stick{position:absolute;top:50%;left:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;background:rgba(255,255,255,0.35);border:1px solid rgba(255,255,255,0.5);pointer-events:none;}
+#jump-btn{position:fixed;right:28px;bottom:172px;width:64px;height:64px;border-radius:50%;background:rgba(120,255,160,0.18);border:1px solid rgba(150,255,180,0.5);color:#cfffdd;font-family:monospace;font-size:11px;z-index:20;touch-action:none;display:flex;align-items:center;justify-content:center;}
+@media (min-width:900px){ .joy-zone,#jump-btn{display:none;} }
 </style>
 </head><body>
 <div id="info">loading...</div>
 <div id="crosshair"></div>
-<div id="hint">Click canvas to look around · WASD move · Space jump</div>
+<div id="hint">Keyboard: WASD move, mouse look, Space jump · Touch: joysticks + JUMP button</div>
+<div class="joy-zone" id="joy-move"><div class="joy-stick" id="joy-move-stick"></div></div>
+<div class="joy-zone" id="joy-look"><div class="joy-stick" id="joy-look-stick"></div></div>
+<button id="jump-btn">JUMP</button>
 <script type="importmap">
 { "imports": { "three": "./three.webgpu.js", "three/webgpu": "./three.webgpu.js", "three/tsl": "./three.tsl.js" } }
 </script>
@@ -257,6 +266,62 @@ try{
     player.pitch = Math.max(-1.4, Math.min(1.4, player.pitch - e.movementY*0.0025));
   });
 
+  // ── Touch joysticks (tablet/no-keyboard support) ─────────────────
+  // Real bug avoided here: touch coordinates must be tracked per
+  // touch.identifier, not just "the last touch," or a second finger
+  // (e.g. look-stick while move-stick is still held) steals the first
+  // finger's drag state and both sticks jump around.
+  const joyMove = { x:0, y:0 };
+  const joyLook = { dx:0, dy:0 };
+  function setupJoystick(zoneId, stickId, onMove, onEnd){
+    const zone = document.getElementById(zoneId);
+    const stick = document.getElementById(stickId);
+    let touchId = null, cx=0, cy=0;
+    const radius = 66;
+    function start(e){
+      const t = e.changedTouches[0];
+      touchId = t.identifier;
+      const rect = zone.getBoundingClientRect();
+      cx = rect.left+rect.width/2; cy = rect.top+rect.height/2;
+      e.preventDefault();
+    }
+    function move(e){
+      for(const t of e.changedTouches){
+        if(t.identifier!==touchId) continue;
+        let dx=t.clientX-cx, dy=t.clientY-cy;
+        const len=Math.hypot(dx,dy);
+        if(len>radius){ dx=dx/len*radius; dy=dy/len*radius; }
+        stick.style.transform = `translate(${dx}px,${dy}px)`;
+        onMove(dx/radius, dy/radius);
+        e.preventDefault();
+      }
+    }
+    function end(e){
+      for(const t of e.changedTouches){
+        if(t.identifier!==touchId) continue;
+        touchId=null;
+        stick.style.transform = '';
+        onEnd();
+      }
+    }
+    zone.addEventListener('touchstart', start, {passive:false});
+    zone.addEventListener('touchmove', move, {passive:false});
+    zone.addEventListener('touchend', end, {passive:false});
+    zone.addEventListener('touchcancel', end, {passive:false});
+  }
+  setupJoystick('joy-move','joy-move-stick',
+    (nx,ny)=>{ joyMove.x=nx; joyMove.y=ny; },
+    ()=>{ joyMove.x=0; joyMove.y=0; });
+  setupJoystick('joy-look','joy-look-stick',
+    (nx,ny)=>{ joyLook.dx=nx; joyLook.dy=ny; },
+    ()=>{ joyLook.dx=0; joyLook.dy=0; });
+
+  let jumpHeld = false;
+  const jumpBtn = document.getElementById('jump-btn');
+  jumpBtn.addEventListener('touchstart', e=>{ jumpHeld=true; e.preventDefault(); }, {passive:false});
+  jumpBtn.addEventListener('touchend', e=>{ jumpHeld=false; e.preventDefault(); }, {passive:false});
+  jumpBtn.addEventListener('touchcancel', ()=>{ jumpHeld=false; });
+
   const GRAVITY = 9.0;
   const MOVE_SPEED = 4.5;
   const JUMP_SPEED = 5.2;
@@ -264,6 +329,11 @@ try{
   const qYaw = new THREE.Quaternion(), qPitch = new THREE.Quaternion();
 
   function updatePlayer(dt){
+    // Look-stick applies a continuous rotation rate (it's a joystick,
+    // not a mouse-delta) — proportional to how far it's pushed.
+    player.yaw -= joyLook.dx*dt*2.4;
+    player.pitch = Math.max(-1.4, Math.min(1.4, player.pitch - joyLook.dy*dt*2.4));
+
     const dir = player.pos.clone().normalize();
     tmpUp.copy(dir);
 
@@ -277,13 +347,15 @@ try{
     let moveX=0, moveZ=0;
     if(keys['KeyW']) moveZ+=1; if(keys['KeyS']) moveZ-=1;
     if(keys['KeyD']) moveX+=1; if(keys['KeyA']) moveX-=1;
+    moveX += joyMove.x; moveZ -= joyMove.y; // joystick y is screen-down-positive, forward is up-on-stick
     const moveVec = new THREE.Vector3().addScaledVector(fwd,moveZ).addScaledVector(right,moveX);
-    if(moveVec.lengthSq()>0) moveVec.normalize().multiplyScalar(MOVE_SPEED);
+    if(moveVec.lengthSq()>1) moveVec.normalize();
+    moveVec.multiplyScalar(MOVE_SPEED);
 
     player.vel.addScaledVector(tmpUp, -GRAVITY*dt);
     player.vel.copy(moveVec).addScaledVector(tmpUp, player.vel.dot(tmpUp));
 
-    if(keys['Space'] && player.onGround){
+    if((keys['Space'] || jumpHeld) && player.onGround){
       player.vel.addScaledVector(tmpUp, JUMP_SPEED);
       player.onGround = false;
     }
