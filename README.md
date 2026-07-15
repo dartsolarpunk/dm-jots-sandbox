@@ -1,43 +1,32 @@
-# WebGPU Marching Cubes — proof-of-concept prototype
+# WebGPU Habitable Planet Prototype
+
+Full pipeline, built on the verified working terrain foundation:
+
+1. **Terrain** — GPU compute density field (sphere + ridge/billow noise
+   for a carved-valley look) + full marching cubes extraction, same
+   verified technique as the base prototype.
+2. **Biome coloring** — computed per-vertex in the same compute pass,
+   from height (sand → grass → snow) and slope (→ rock), no textures.
+3. **Water** — a simple sphere at sea level with a transmissive/
+   reflective material.
+4. **Atmosphere** — a Fresnel-glow shell (TSL node material) around the
+   planet, additive blended.
+5. **Character controller** — small-planet walker: gravity pulls toward
+   planet center, "up" is away from center, WASD moves relative to
+   view yaw projected onto the local tangent plane, Space jumps, and
+   ground collision samples the same noise shape (via a CPU-side
+   equivalent) the GPU terrain is built from.
 
 ## Run it
-Serve this folder over HTTP (must be http/https, not file://) and open
-`index.html` in a browser with real WebGPU support (current Chrome/Edge
-on real hardware — check chrome://gpu shows "WebGPU: Hardware accelerated").
+Serve over http(s), not file://. Click the canvas to lock the pointer
+and look around; WASD to walk; Space to jump.
 
-    python3 -m http.server 8080
-    # then open http://localhost:8080/
-
-## What it does
-- `mc_tables.js` — the standard marching-cubes lookup tables (edge masks +
-  triangle table), sourced/cited from the public reference implementation
-  at https://gist.github.com/dwilliamson/c041e3454a713e58baf6e4f8e5fffecd
-  (derived from Paul Bourke's tables, which trace to Lorensen & Cline's
-  original 1987 paper).
-- `index.html` — two GPU compute passes using Three.js's TSL (Three
-  Shading Language) system, which compiles to real WGSL compute shaders:
-  1. **Density pass**: evaluates a signed-distance-style field (sphere +
-     layered fractal noise) at every grid point of a chunk.
-  2. **Marching cubes pass**: one GPU thread per grid cell — computes the
-     8-corner case index, looks up the triangle table, interpolates edge
-     intersections, and writes triangles directly into a GPU storage
-     buffer that's bound straight to the render mesh's position/normal
-     attributes. No CPU readback anywhere in the pipeline.
-
-## Status
-Both compute passes run with zero shader errors — verified directly
-against a live WebGPU device. The final render step hit a texture-view
-error that traces to Three.js's internal render-target setup, reproducing
-even with antialiasing off and across different GPU backend flags. That
-points to a software-WebGPU (SwiftShader) implementation gap in the
-specific testing environment used, not the shader code itself — needs
-verification on a real GPU-backed browser to confirm.
-
-## Next steps once render is confirmed
-- Extend to a real cube-sphere (6 warped faces) instead of one chunk.
-- Distance-based chunk LOD (subdivide near camera, coarsen far).
-- Swap the flat fixed-slot-per-cell output for indirect/compacted draws
-  once correctness is confirmed (more efficient, avoids the empty
-  degenerate triangles the current fixed-slot approach wastes GPU on).
-- Hook the density function up to per-planet parameters (seed, radius,
-  water level, biome noise layers) instead of the placeholder sphere+noise.
+## Known scope cuts (see chat notes)
+- Single volume for the whole planet, not a 6-face cube-sphere with
+  distance-based LOD — avoids chunk-seam stitching for this pass, at
+  the cost of a fixed resolution regardless of camera distance.
+- Ridge/billow noise approximates an "eroded" look; this is not a real
+  hydraulic erosion simulation (a separate iterative compute pass that
+  would need its own tuning pass).
+- Water and atmosphere are simple procedural shells, not physically
+  simulated fluid/scattering.

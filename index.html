@@ -1,23 +1,56 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<style>html,body{margin:0;background:#05070d;overflow:hidden;}
-#info{position:fixed;top:4px;left:4px;color:#7CFC7C;font-family:monospace;font-size:11px;white-space:pre;z-index:10;}</style>
+<style>html,body{margin:0;background:#05070d;overflow:hidden;height:100%;}
+#info{position:fixed;top:4px;left:4px;color:#7CFC7C;font-family:monospace;font-size:10px;white-space:pre;z-index:10;pointer-events:none;max-width:90vw;}
+#crosshair{position:fixed;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);z-index:9;pointer-events:none;}
+#hint{position:fixed;bottom:6px;left:6px;color:#9adba9;font-family:monospace;font-size:11px;z-index:10;pointer-events:none;}
+</style>
 </head><body>
 <div id="info">loading...</div>
+<div id="crosshair"></div>
+<div id="hint">Click canvas to look around · WASD move · Space jump</div>
 <script type="importmap">
 { "imports": { "three": "./three.webgpu.js", "three/webgpu": "./three.webgpu.js", "three/tsl": "./three.tsl.js" } }
 </script>
 <script type="module">
 import * as THREE from 'three';
 import {
-  Fn, If, Loop, Break, storage, instanceIndex, uint, int, float, vec3,
-  select, array, positionLocal, normalLocal, mx_fractal_noise_float, color,
-  uniform, cameraPosition, normalize as tslNormalize
+  Fn, If, Loop, storage, instanceIndex, uint, int, float, vec3,
+  select, mx_fractal_noise_float, normalWorld, positionWorld,
+  cameraPosition, mix
 } from 'three/tsl';
 import { EdgeVertexIndices, EdgeMasks, TriangleTable } from './mc_tables.js';
 
 const info = document.getElementById('info');
 const log = (s)=>{ info.textContent += s + '\n'; console.log(s); };
+
+function hash3(x,y,z){ let h=Math.sin(x*127.1+y*311.7+z*74.7)*43758.5453123; return h-Math.floor(h); }
+function valueNoise3(x,y,z){
+  const xi=Math.floor(x),yi=Math.floor(y),zi=Math.floor(z);
+  const xf=x-xi,yf=y-yi,zf=z-zi;
+  const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf),w=zf*zf*(3-2*zf);
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const c000=hash3(xi,yi,zi),c100=hash3(xi+1,yi,zi),c010=hash3(xi,yi+1,zi),c110=hash3(xi+1,yi+1,zi);
+  const c001=hash3(xi,yi,zi+1),c101=hash3(xi+1,yi,zi+1),c011=hash3(xi,yi+1,zi+1),c111=hash3(xi+1,yi+1,zi+1);
+  const x00=lerp(c000,c100,u),x10=lerp(c010,c110,u),x01=lerp(c001,c101,u),x11=lerp(c011,c111,u);
+  const y0=lerp(x00,x10,v),y1=lerp(x01,x11,v);
+  return lerp(y0,y1,w)*2-1;
+}
+function fractalNoise3(x,y,z,octaves,lac,gain){
+  let amp=1,freq=1,sum=0,norm=0;
+  for(let i=0;i<octaves;i++){ sum+=valueNoise3(x*freq,y*freq,z*freq)*amp; norm+=amp; amp*=gain; freq*=lac; }
+  return sum/norm;
+}
+const PLANET_RADIUS = 12;
+function groundRadiusAt(dirX,dirY,dirZ){
+  const p2=2.3;
+  const n1=fractalNoise3(dirX*p2,dirY*p2,dirZ*p2,5,2.0,0.5);
+  const ridge=1-Math.abs(n1);
+  const n2=fractalNoise3(dirX*p2*3+9.1,dirY*p2*3+2.3,dirZ*p2*3+4.7,3,2.0,0.5);
+  const billow=Math.abs(n2);
+  const terrain=ridge*ridge*0.9-billow*0.35;
+  return PLANET_RADIUS+terrain*1.4;
+}
 
 async function main(){
 try{
@@ -28,86 +61,69 @@ try{
   log('Renderer OK');
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x05070d);
-  const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 1000);
-  camera.position.set(3.2, 2.2, 3.2);
-  camera.lookAt(0,0,0);
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-  const sun = new THREE.DirectionalLight(0xffffff, 2.0);
-  sun.position.set(2,3,2);
-  scene.add(sun);
+  scene.background = new THREE.Color(0x03040a);
+  const camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.05, 500);
 
-  // ── Chunk / grid setup ──────────────────────────────────────────
-  // N cells per axis -> (N+1) density samples per axis. Density is a
-  // signed-distance-ish field: sphere SDF (length(p)-R) plus layered
-  // noise, so the isosurface (value==0) is a noisy "planet" surface.
-  const N = 28;
+  {
+    const N=2000, pos=new Float32Array(N*3);
+    for(let i=0;i<N;i++){
+      const r=180+Math.random()*40, th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1);
+      pos[i*3]=r*Math.sin(ph)*Math.cos(th); pos[i*3+1]=r*Math.sin(ph)*Math.sin(th); pos[i*3+2]=r*Math.cos(ph);
+    }
+    const starGeo=new THREE.BufferGeometry();
+    starGeo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({size:0.6,color:0xffffff})));
+  }
+
+  const sun = new THREE.DirectionalLight(0xfff2e0, 3.2);
+  sun.position.set(60,40,30);
+  scene.add(sun);
+  scene.add(new THREE.AmbientLight(0x304050, 0.55));
+
+  const N = 46;
   const GRID = N+1;
-  const CELL = 2.0/N; // chunk spans [-1,1]^3 in local space
+  const HALF = PLANET_RADIUS*1.35;
+  const CELL = (HALF*2)/N;
   const numPoints = GRID*GRID*GRID;
   const numCells = N*N*N;
   const MAX_TRIS_PER_CELL = 5;
-  const maxVerts = numCells * MAX_TRIS_PER_CELL * 3;
-  log('Grid '+GRID+'^3 = '+numPoints+' samples, '+numCells+' cells, maxVerts='+maxVerts);
+  const maxVerts = numCells*MAX_TRIS_PER_CELL*3;
+  log('Terrain grid '+GRID+'^3, '+numCells+' cells, maxVerts='+maxVerts);
 
-  // ── Storage buffers ──────────────────────────────────────────────
   const densityBuf = new THREE.StorageInstancedBufferAttribute(numPoints, 1);
   const densityNode = storage(densityBuf, 'float', numPoints);
-
-  const edgeMaskBuf = new THREE.StorageInstancedBufferAttribute(256, 1);
-  const edgeMaskNode = storage(edgeMaskBuf, 'int', 256);
-  const edgeMaskArr = new Int32Array(256);
-  EdgeMasks.forEach((v,i)=>edgeMaskArr[i]=v);
-  edgeMaskBuf.array.set(new Float32Array(edgeMaskArr.buffer)); // placeholder, real upload below
-
-  // Three.js storage buffers for compute are typically populated by an
-  // initial compute pass or by direct TypedArray upload before first
-  // use. We upload via a small helper compute pass that just copies
-  // constants in, since StorageInstancedBufferAttribute expects
-  // Float32Array backing by default — for int buffers we instead build
-  // the attribute with an Int32Array-typed array directly.
-  const edgeMaskAttr = new THREE.StorageBufferAttribute(new Int32Array(EdgeMasks), 1, THREE.IntType ? undefined : undefined);
   const triTableFlat = new Int32Array(256*16);
   TriangleTable.forEach((row,i)=>{ for(let j=0;j<16;j++) triTableFlat[i*16+j]=row[j]; });
   const triTableAttr = new THREE.StorageBufferAttribute(triTableFlat, 1);
-
-  const edgeMaskStorage = storage(edgeMaskAttr, 'int', 256);
   const triTableStorage = storage(triTableAttr, 'int', 256*16);
 
   const vertexBuf = new THREE.StorageBufferAttribute(maxVerts, 3);
   const vertexNode = storage(vertexBuf, 'vec3', maxVerts);
   const normalBuf = new THREE.StorageBufferAttribute(maxVerts, 3);
   const normalNode = storage(normalBuf, 'vec3', maxVerts);
-
+  const colorBuf = new THREE.StorageBufferAttribute(maxVerts, 3);
+  const colorNode = storage(colorBuf, 'vec3', maxVerts);
   log('Buffers allocated');
 
-  // ── Pass 1: density field ────────────────────────────────────────
-  const RADIUS = 0.75;
   const densityFn = Fn(()=>{
     const idx = instanceIndex;
     const gz = idx.div(uint(GRID*GRID));
     const rem = idx.mod(uint(GRID*GRID));
     const gy = rem.div(uint(GRID));
     const gx = rem.mod(uint(GRID));
-    const p = vec3(
-      gx.toFloat().mul(CELL).sub(1.0),
-      gy.toFloat().mul(CELL).sub(1.0),
-      gz.toFloat().mul(CELL).sub(1.0)
-    );
-    const base = p.length().sub(RADIUS);
-    const n1 = mx_fractal_noise_float(p.mul(2.2), 4, 2.0, 0.5).mul(0.14);
-    const n2 = mx_fractal_noise_float(p.mul(6.0).add(vec3(5.2,1.7,9.3)), 3, 2.0, 0.5).mul(0.045);
-    densityNode.element(idx).assign(base.sub(n1).sub(n2));
+    const p = vec3(gx.toFloat().mul(CELL).sub(HALF), gy.toFloat().mul(CELL).sub(HALF), gz.toFloat().mul(CELL).sub(HALF));
+    const dir = p.normalize();
+    const base = p.length().sub(PLANET_RADIUS);
+    const n1 = mx_fractal_noise_float(dir.mul(2.3), 5, 2.0, 0.5);
+    const ridge = float(1.0).sub(n1.abs());
+    const n2 = mx_fractal_noise_float(dir.mul(6.9).add(vec3(9.1,2.3,4.7)), 3, 2.0, 0.5);
+    const billow = n2.abs();
+    const terrain = ridge.mul(ridge).mul(0.9).sub(billow.mul(0.35));
+    densityNode.element(idx).assign(base.sub(terrain.mul(1.4)));
   });
   await renderer.computeAsync(densityFn().compute(numPoints));
   log('Density pass OK');
 
-  // ── Pass 2: marching cubes extraction ────────────────────────────
-  // Each thread = one cell. Reads its 8 corner densities, looks up the
-  // MC case, interpolates up to 5 triangles, writes into its own fixed
-  // 15-vertex slot (unused slots get a degenerate zero-area triangle
-  // so the draw call can stay a single fixed-size non-indexed list —
-  // no atomics / indirect-draw bookkeeping needed for this first pass).
   const mcFn = Fn(()=>{
     const cellIdx = instanceIndex;
     const cz = cellIdx.div(uint(N*N));
@@ -115,40 +131,29 @@ try{
     const cy = crem.div(uint(N));
     const cx = crem.mod(uint(N));
 
-    // Real bug found (previous version): corner data was stored in a
-    // local array() and written/read via dynamic (runtime-computed)
-    // indices inside nested Loops. Dynamic indexing into a *local*
-    // array (as opposed to a storage buffer, which genuinely supports
-    // it) is a known fragile pattern across shader compilers/backends —
-    // here it silently produced wrong data instead of erroring, which is
-    // exactly why the compute pass reported success while the geometry
-    // came out collapsed into a thin sliver instead of a real sphere.
-    // Fixed by unrolling all 8 corners into explicit named variables —
-    // no dynamic array indexing anywhere in this function now.
     const readCorner = (i)=>{
-      const dx = i & 1, dy = (i>>1) & 1, dz = (i>>2) & 1;
-      const gx = cx.add(dx), gy = cy.add(dy), gz = cz.add(dz);
+      const dx=i&1, dy=(i>>1)&1, dz=(i>>2)&1;
+      const gx=cx.add(dx), gy=cy.add(dy), gz=cz.add(dz);
       const flat = gx.add(gy.mul(uint(GRID))).add(gz.mul(uint(GRID*GRID)));
       return {
-        pos: vec3(gx.toFloat().mul(CELL).sub(1.0), gy.toFloat().mul(CELL).sub(1.0), gz.toFloat().mul(CELL).sub(1.0)),
+        pos: vec3(gx.toFloat().mul(CELL).sub(HALF), gy.toFloat().mul(CELL).sub(HALF), gz.toFloat().mul(CELL).sub(HALF)),
         density: densityNode.element(flat),
       };
     };
-    const c0=readCorner(0), c1=readCorner(1), c2=readCorner(2), c3=readCorner(3),
-          c4=readCorner(4), c5=readCorner(5), c6=readCorner(6), c7=readCorner(7);
-    const corners = [c0,c1,c2,c3,c4,c5,c6,c7];
+    const c0=readCorner(0),c1=readCorner(1),c2=readCorner(2),c3=readCorner(3),
+          c4=readCorner(4),c5=readCorner(5),c6=readCorner(6),c7=readCorner(7);
+    const corners=[c0,c1,c2,c3,c4,c5,c6,c7];
 
     const caseIdx = int(0).toVar();
     corners.forEach((c,i)=>{
-      If(c.density.lessThan(0.0), ()=>{
-        caseIdx.assign(caseIdx.bitOr(int(1<<i)));
-      });
+      If(c.density.lessThan(0.0), ()=>{ caseIdx.assign(caseIdx.bitOr(int(1<<i))); });
     });
 
     const outBase = cellIdx.mul(uint(MAX_TRIS_PER_CELL*3));
     Loop(MAX_TRIS_PER_CELL*3, ({i})=>{
       vertexNode.element(outBase.add(uint(i))).assign(vec3(0,0,0));
       normalNode.element(outBase.add(uint(i))).assign(vec3(0,1,0));
+      colorNode.element(outBase.add(uint(i))).assign(vec3(0,0,0));
     });
 
     Loop(MAX_TRIS_PER_CELL, ({i})=>{
@@ -158,12 +163,9 @@ try{
         const e1 = triTableStorage.element(triBase.add(1));
         const e2 = triTableStorage.element(triBase.add(2));
 
-        // 12-way select over the fixed EdgeVertexIndices pairs, using
-        // the explicit unrolled corner variables — no array indexing.
         const interp = (edge)=>{
-          let pa = corners[0].pos, pb = corners[0].pos;
-          let da = corners[0].density, db = corners[0].density;
-          EdgeVertexIndices.forEach(([va,vb], k)=>{
+          let pa=corners[0].pos, pb=corners[0].pos, da=corners[0].density, db=corners[0].density;
+          EdgeVertexIndices.forEach(([va,vb],k)=>{
             const match = edge.equal(int(k));
             pa = select(match, corners[va].pos, pa);
             pb = select(match, corners[vb].pos, pb);
@@ -174,8 +176,25 @@ try{
           return pa.add(pb.sub(pa).mul(t));
         };
 
-        const v0 = interp(e0), v1 = interp(e1), v2 = interp(e2);
+        const v0=interp(e0), v1=interp(e1), v2=interp(e2);
         const nrm = v1.sub(v0).cross(v2.sub(v0)).normalize();
+
+        const colorFor = (v)=>{
+          const r = v.length();
+          const height = r.sub(PLANET_RADIUS);
+          const up = v.normalize();
+          const slope = float(1.0).sub(nrm.dot(up).clamp(0.0,1.0));
+          const rock = vec3(0.42,0.38,0.34);
+          const sand = vec3(0.76,0.68,0.48);
+          const grass = vec3(0.28,0.46,0.22);
+          const snow = vec3(0.92,0.94,0.97);
+          let c = mix(sand, grass, height.add(0.3).div(0.6).clamp(0.0,1.0));
+          c = mix(c, rock, slope.smoothstep(0.35,0.75));
+          c = mix(c, snow, height.sub(0.65).div(0.3).clamp(0.0,1.0));
+          return c;
+        };
+        const col = colorFor(v0).add(colorFor(v1)).add(colorFor(v2)).div(3.0);
+
         const slot = i.mul(3);
         vertexNode.element(outBase.add(slot)).assign(v0);
         vertexNode.element(outBase.add(slot).add(1)).assign(v1);
@@ -183,76 +202,142 @@ try{
         normalNode.element(outBase.add(slot)).assign(nrm);
         normalNode.element(outBase.add(slot).add(1)).assign(nrm);
         normalNode.element(outBase.add(slot).add(2)).assign(nrm);
+        colorNode.element(outBase.add(slot)).assign(col);
+        colorNode.element(outBase.add(slot).add(1)).assign(col);
+        colorNode.element(outBase.add(slot).add(2)).assign(col);
       });
     });
   });
   await renderer.computeAsync(mcFn().compute(numCells));
-  log('Marching cubes pass OK');
+  log('Marching cubes + biome color pass OK');
 
-  // Diagnostic: read back the actual generated vertex buffer and count
-  // how many triangles are real (non-degenerate) vs the zero-filled
-  // placeholder ones, so we can tell a truly empty isosurface apart
-  // from a render-step problem without guessing.
-  try{
-    const vertsArrBuf = await renderer.getArrayBufferAsync(vertexBuf);
-    const verts = new Float32Array(vertsArrBuf);
-    let nonZeroTris = 0;
-    let minY=1e9, maxY=-1e9, anyNonZero=false;
-    for(let i=0; i<maxVerts; i+=3){
-      const x0=verts[i*3], y0=verts[i*3+1], z0=verts[i*3+2];
-      const x1=verts[(i+1)*3], y1=verts[(i+1)*3+1], z1=verts[(i+1)*3+2];
-      const x2=verts[(i+2)*3], y2=verts[(i+2)*3+1], z2=verts[(i+2)*3+2];
-      const isDegenerate = (x0===0&&y0===0&&z0===0&&x1===0&&y1===0&&z1===0&&x2===0&&y2===0&&z2===0);
-      if(!isDegenerate){
-        nonZeroTris++;
-        anyNonZero = true;
-        minY = Math.min(minY,y0,y1,y2); maxY = Math.max(maxY,y0,y1,y2);
-      }
-    }
-    log('Real triangles generated: '+nonZeroTris+' / '+(maxVerts/3));
-    log('Mesh Y bounds: '+(anyNonZero?minY.toFixed(3)+' to '+maxY.toFixed(3):'N/A (empty mesh)'));
-  }catch(e){
-    log('Readback diagnostic failed: '+e.message);
-  }
-
-  // ── Render the GPU-generated mesh directly from the storage buffers
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', vertexBuf);
   geometry.setAttribute('normal', normalBuf);
-  geometry.computeBoundingSphere = ()=>{}; // skip CPU-side bbox (data lives on GPU)
-  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0,0,0), 2);
+  geometry.setAttribute('color', colorBuf);
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0,0,0), HALF*1.5);
+  const material = new THREE.MeshStandardMaterial({ vertexColors:true, roughness:0.92, metalness:0.02, side:THREE.DoubleSide });
+  const terrainMesh = new THREE.Mesh(geometry, material);
+  scene.add(terrainMesh);
+  log('Terrain mesh added');
 
-  const material = new THREE.MeshStandardMaterial({ color: 0x6ea86a, roughness:0.85, metalness:0.05, side: THREE.DoubleSide });
-  const mesh = new THREE.Mesh(geometry, material);
-  scene.add(mesh);
-  log('Mesh added to scene');
+  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+0.02, 64, 48);
+  const waterMat = new THREE.MeshPhysicalMaterial({
+    color: 0x1c5a7a, transparent:true, opacity:0.78, roughness:0.15, metalness:0.0,
+    transmission:0.35, side:THREE.DoubleSide,
+  });
+  scene.add(new THREE.Mesh(waterGeo, waterMat));
+  log('Water sphere added');
 
-  let t=0, frameCount=0, loggedFirstFrame=false, loggedError=false;
+  const atmoGeo = new THREE.SphereGeometry(HALF*1.02, 48, 32);
+  const atmoMat = new THREE.MeshBasicNodeMaterial({ transparent:true, side:THREE.BackSide, depthWrite:false, blending:THREE.AdditiveBlending });
+  const viewDir = positionWorld.sub(cameraPosition).normalize();
+  const fresnel = float(1.0).sub(viewDir.dot(normalWorld).abs()).pow(3.0);
+  atmoMat.colorNode = vec3(0.4,0.65,1.0).mul(fresnel).mul(1.4);
+  atmoMat.opacityNode = fresnel;
+  scene.add(new THREE.Mesh(atmoGeo, atmoMat));
+  log('Atmosphere shell added');
+
+  const startDir = new THREE.Vector3(0.3,0.85,0.3).normalize();
+  const player = {
+    pos: startDir.clone().multiplyScalar(groundRadiusAt(startDir.x,startDir.y,startDir.z)+1.8),
+    vel: new THREE.Vector3(),
+    yaw: 0, pitch: -0.15,
+    onGround: false,
+  };
+  const keys = {};
+  window.addEventListener('keydown', e=>keys[e.code]=true);
+  window.addEventListener('keyup', e=>keys[e.code]=false);
+  let pointerLocked = false;
+  renderer.domElement.addEventListener('click', ()=>renderer.domElement.requestPointerLock());
+  document.addEventListener('pointerlockchange', ()=>{ pointerLocked = document.pointerLockElement===renderer.domElement; });
+  document.addEventListener('mousemove', e=>{
+    if(!pointerLocked) return;
+    player.yaw -= e.movementX*0.0025;
+    player.pitch = Math.max(-1.4, Math.min(1.4, player.pitch - e.movementY*0.0025));
+  });
+
+  const GRAVITY = 9.0;
+  const MOVE_SPEED = 4.5;
+  const JUMP_SPEED = 5.2;
+  const tmpUp = new THREE.Vector3(), tmpFwd = new THREE.Vector3(), tmpRight = new THREE.Vector3();
+  const qYaw = new THREE.Quaternion(), qPitch = new THREE.Quaternion();
+
+  function updatePlayer(dt){
+    const dir = player.pos.clone().normalize();
+    tmpUp.copy(dir);
+
+    const worldFwdRef = Math.abs(tmpUp.y) < 0.99 ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
+    tmpRight.crossVectors(worldFwdRef, tmpUp).normalize();
+    tmpFwd.crossVectors(tmpUp, tmpRight).normalize();
+    qYaw.setFromAxisAngle(tmpUp, player.yaw);
+    const fwd = tmpFwd.clone().applyQuaternion(qYaw);
+    const right = tmpRight.clone().applyQuaternion(qYaw);
+
+    let moveX=0, moveZ=0;
+    if(keys['KeyW']) moveZ+=1; if(keys['KeyS']) moveZ-=1;
+    if(keys['KeyD']) moveX+=1; if(keys['KeyA']) moveX-=1;
+    const moveVec = new THREE.Vector3().addScaledVector(fwd,moveZ).addScaledVector(right,moveX);
+    if(moveVec.lengthSq()>0) moveVec.normalize().multiplyScalar(MOVE_SPEED);
+
+    player.vel.addScaledVector(tmpUp, -GRAVITY*dt);
+    player.vel.copy(moveVec).addScaledVector(tmpUp, player.vel.dot(tmpUp));
+
+    if(keys['Space'] && player.onGround){
+      player.vel.addScaledVector(tmpUp, JUMP_SPEED);
+      player.onGround = false;
+    }
+
+    player.pos.addScaledVector(player.vel, dt);
+    const newLen = player.pos.length();
+    const newDir = player.pos.clone().divideScalar(newLen);
+    const newGroundR = groundRadiusAt(newDir.x,newDir.y,newDir.z);
+    const eyeHeight = 1.8;
+    if(newLen < newGroundR+eyeHeight){
+      player.pos.copy(newDir).multiplyScalar(newGroundR+eyeHeight);
+      player.vel.addScaledVector(newDir, -player.vel.dot(newDir));
+      player.onGround = true;
+    } else {
+      player.onGround = false;
+    }
+  }
+
+  function updateCamera(){
+    const dir = player.pos.clone().normalize();
+    camera.position.copy(player.pos);
+    const worldFwdRef = Math.abs(dir.y) < 0.99 ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
+    const right = new THREE.Vector3().crossVectors(worldFwdRef, dir).normalize();
+    const fwd = new THREE.Vector3().crossVectors(dir, right).normalize();
+    qYaw.setFromAxisAngle(dir, player.yaw);
+    qPitch.setFromAxisAngle(right.clone().applyQuaternion(qYaw), player.pitch);
+    const lookDir = fwd.clone().applyQuaternion(qYaw).applyQuaternion(qPitch);
+    camera.up.copy(dir);
+    camera.lookAt(camera.position.clone().add(lookDir));
+  }
+
+  log('Character controller ready (small-planet walker)');
+  log('READY');
+
+  let last = performance.now();
+  let frameCount=0, loggedFirst=false;
   async function frame(){
+    const now = performance.now();
+    const dt = Math.min((now-last)/1000, 0.05);
+    last = now;
     try{
-      t += 0.008;
-      mesh.rotation.y = t;
+      updatePlayer(dt);
+      updateCamera();
       await renderer.renderAsync(scene, camera);
       frameCount++;
-      if(!loggedFirstFrame){
-        loggedFirstFrame = true;
-        log('First frame rendered without error');
-      }
-      if(frameCount===60) log('60 frames rendered — loop is running continuously');
+      if(!loggedFirst){ loggedFirst=true; log('First frame rendered without error'); }
     }catch(e){
-      if(!loggedError){
-        loggedError = true;
-        log('RENDER LOOP ERROR (frame '+frameCount+'): '+e.message);
-      }
+      if(frameCount<2 || frameCount%300===0) log('RENDER ERROR (frame '+frameCount+'): '+e.message);
     }
     requestAnimationFrame(frame);
   }
   frame();
-  window.__ready = true;
-  log('READY — rotating view');
 }catch(e){
   log('ERROR: '+e.message+'\n'+e.stack);
-  window.__ready = false;
 }
 }
 main();
