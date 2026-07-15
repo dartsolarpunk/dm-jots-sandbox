@@ -29,9 +29,10 @@
 <script type="module">
 import * as THREE from 'three';
 import {
-  Fn, If, Loop, storage, instanceIndex, uint, int, float, vec3,
-  select, mx_fractal_noise_float, normalWorld, positionWorld,
-  cameraPosition, mix
+  Fn, If, Loop, storage, instanceIndex, uint, int, float, vec3, vec4,
+  select, mx_fractal_noise_float, normalWorld, positionWorld, positionView,
+  cameraPosition, mix, viewportLinearDepth, linearDepth, screenUV, time,
+  normalize as tslNormalize, smoothstep, clamp, pow, reflect, dot
 } from 'three/tsl';
 import { EdgeVertexIndices, EdgeMasks, TriangleTable } from './mc_tables.js';
 
@@ -243,13 +244,47 @@ try{
   scene.add(terrainMesh);
   log('Terrain mesh added');
 
-  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+0.02, 64, 48);
-  const waterMat = new THREE.MeshPhysicalMaterial({
-    color: 0x1c5a7a, transparent:true, opacity:0.78, roughness:0.15, metalness:0.0,
-    transmission:0.35, side:THREE.DoubleSide,
+  // ── Water: depth-aware shading. The terrain (opaque) renders first
+  // in the same frame, so by the time this transparent water fragment
+  // shades, viewportLinearDepth already holds "whatever's behind me" -
+  // comparing that to this fragment's own depth gives the water column
+  // thickness at each point, which drives color/opacity (shallow near
+  // shore = lighter/more see-through, deep = darker/more opaque),
+  // shoreline foam (thickness near zero), and it's all recomputed live
+  // if the terrain changes, no separate baked mask needed.
+  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+0.02, 96, 64);
+  const waterMat = new THREE.MeshStandardNodeMaterial({
+    transparent:true, side:THREE.DoubleSide, depthWrite:false, roughness:0.2, metalness:0.05,
   });
+
+  const sceneDepth = viewportLinearDepth;
+  const surfaceDepth = linearDepth(positionView.z);
+  const depthDiff = sceneDepth.sub(surfaceDepth).max(0.0);
+  const depthFactor = depthDiff.mul(60.0).clamp(0.0, 1.0);
+
+  const shallowColor = vec3(0.30, 0.72, 0.68);
+  const deepColor = vec3(0.02, 0.09, 0.20);
+  const baseColor = mix(shallowColor, deepColor, depthFactor);
+
+  // Shoreline foam: a thin band where depth-into-water is near zero.
+  const foam = float(1.0).sub(smoothstep(0.0, 0.008, depthDiff));
+  const foamNoise = mx_fractal_noise_float(positionWorld.mul(8.0).add(vec3(time.mul(0.3),0,time.mul(0.2))), 3, 2.0, 0.5);
+  const foamMask = foam.mul(smoothstep(0.15, 0.6, foamNoise.mul(0.5).add(0.5)).add(0.4).clamp(0.0,1.0));
+
+  waterMat.colorNode = mix(baseColor, vec3(1,1,1), foamMask);
+  waterMat.opacityNode = clamp(float(0.35).add(depthFactor.mul(0.55)).add(foamMask.mul(0.45)), 0.0, 0.96);
+
+  // Animated wave normal: perturbs the shading normal with time-scrolling
+  // noise so specular highlights break up into moving glints instead of
+  // one static mirror-like hotspot.
+  const wavePos = positionWorld.mul(2.6).add(vec3(time.mul(0.15), 0.0, time.mul(0.11)));
+  const waveN = mx_fractal_noise_float(wavePos, 4, 2.0, 0.5);
+  const wavePos2 = positionWorld.mul(2.6).add(vec3(time.mul(0.11).add(50.0), 0.0, time.mul(-0.13)));
+  const waveN2 = mx_fractal_noise_float(wavePos2, 4, 2.0, 0.5);
+  waterMat.normalNode = tslNormalize(normalWorld.add(vec3(waveN.mul(0.12), waveN2.mul(0.12), waveN.mul(waveN2).mul(0.08))));
+
   scene.add(new THREE.Mesh(waterGeo, waterMat));
-  log('Water sphere added');
+  log('Water sphere added (depth-aware, animated waves, shoreline foam)');
 
   const atmoGeo = new THREE.SphereGeometry(HALF*1.02, 48, 32);
   const atmoMat = new THREE.MeshBasicNodeMaterial({ transparent:true, side:THREE.BackSide, depthWrite:false, blending:THREE.AdditiveBlending });
@@ -416,6 +451,7 @@ try{
 
   let last = performance.now();
   let frameCount=0, loggedFirst=false;
+  let sunAngle = 0.6;
   async function frame(){
     const now = performance.now();
     const dt = Math.min((now-last)/1000, 0.05);
@@ -423,6 +459,10 @@ try{
     try{
       updatePlayer(dt);
       updateCamera();
+      sunAngle += dt*0.04; // slow day/night cycle
+      sun.position.set(Math.cos(sunAngle)*80, Math.sin(sunAngle)*80, 30);
+      const daylight = Math.max(0.15, Math.sin(sunAngle));
+      sun.intensity = 1.0 + daylight*2.6;
       await renderer.renderAsync(scene, camera);
       frameCount++;
       if(!loggedFirst){ loggedFirst=true; log('First frame rendered without error'); }
