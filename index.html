@@ -205,6 +205,36 @@ try{
   const colorNode = storage(colorBuf, 'vec3', maxVerts);
   log('Buffers allocated');
 
+  // Real bug found (reported: no water/particles visible in TIDES tab):
+  // the fluid simulation's collision floor was a FLAT sphere at a fixed
+  // radius, while the actual terrain varies by roughly +/-1.75 units
+  // around that radius (ridges, craters). Wherever real terrain pokes
+  // above that flat floor - which is most of the visible landscape -
+  // particles settling onto the flat floor end up literally buried
+  // under the solid opaque ground, invisible from any camera angle.
+  // Same category of bug as the walking character's collision earlier
+  // in this project, just never carried over to the fluid sim. Fixed by
+  // extracting the terrain height formula into one shared function that
+  // both the density field AND the fluid collision call, so the fluid
+  // rests on the actual terrain surface in every direction, not a flat
+  // sea-level sphere.
+  const terrainRadiusAt = Fn(([dir])=>{
+    const n1 = mx_fractal_noise_float(dir.mul(2.3), 5, 2.0, 0.5);
+    const ridge = float(1.0).sub(n1.abs());
+    const n2 = mx_fractal_noise_float(dir.mul(6.9).add(vec3(9.1,2.3,4.7)), 3, 2.0, 0.5);
+    const billow = n2.abs();
+    const terrain = ridge.mul(ridge).mul(0.9).sub(billow.mul(0.35));
+    const w1 = mx_worley_noise_float(dir.mul(4.2));
+    const profile1 = exp(w1.mul(w1).mul(-22.0));
+    const w2 = mx_worley_noise_float(dir.mul(1.6).add(vec3(31.0,7.0,19.0)));
+    const profile2 = exp(w2.mul(w2).mul(-38.0));
+    const bowl = profile1.mul(0.22).add(profile2.mul(0.55));
+    const rim1 = smoothstep(0.04,0.22,profile1).sub(smoothstep(0.22,0.42,profile1)).mul(0.06);
+    const rim2 = smoothstep(0.03,0.18,profile2).sub(smoothstep(0.18,0.34,profile2)).mul(0.14);
+    const craterRim = rim1.add(rim2);
+    return float(PLANET_RADIUS).add(terrain.mul(1.4)).sub(bowl).add(craterRim);
+  });
+
   const densityFn = Fn(()=>{
     const idx = instanceIndex;
     const gz = idx.div(uint(GRID*GRID));
@@ -214,31 +244,9 @@ try{
     const p = vec3(gx.toFloat().mul(CELL).sub(HALF), gy.toFloat().mul(CELL).sub(HALF), gz.toFloat().mul(CELL).sub(HALF));
     const dir = p.normalize();
     const base = p.length().sub(PLANET_RADIUS);
-    const n1 = mx_fractal_noise_float(dir.mul(2.3), 5, 2.0, 0.5);
-    const ridge = float(1.0).sub(n1.abs());
-    const n2 = mx_fractal_noise_float(dir.mul(6.9).add(vec3(9.1,2.3,4.7)), 3, 2.0, 0.5);
-    const billow = n2.abs();
-    const terrain = ridge.mul(ridge).mul(0.9).sub(billow.mul(0.35));
+    const groundR = terrainRadiusAt(dir);
 
-    // ── Craters, via Worley (cellular) noise. mx_worley_noise_float
-    // returns something distance-like from each point to its nearest
-    // random cell center - small right at a center, growing away from
-    // it. Using exp(-w^2 * k) turns that into a Gaussian bowl profile
-    // that's robust regardless of this implementation's exact output
-    // scale (no need to know its precise numeric range, just that it's
-    // ~0 at centers and grows outward). A second, larger-scale Worley
-    // layer gives bigger/rarer craters than the first, same idea two
-    // asteroid-belt games use to mix crater sizes.
-    const w1 = mx_worley_noise_float(dir.mul(4.2));
-    const profile1 = exp(w1.mul(w1).mul(-22.0));
-    const w2 = mx_worley_noise_float(dir.mul(1.6).add(vec3(31.0,7.0,19.0)));
-    const profile2 = exp(w2.mul(w2).mul(-38.0));
-    const bowl = profile1.mul(0.22).add(profile2.mul(0.55));
-    const rim1 = smoothstep(0.04,0.22,profile1).sub(smoothstep(0.22,0.42,profile1)).mul(0.06);
-    const rim2 = smoothstep(0.03,0.18,profile2).sub(smoothstep(0.18,0.34,profile2)).mul(0.14);
-    const craterRim = rim1.add(rim2);
-
-    densityNode.element(idx).assign(base.sub(terrain.mul(1.4)).add(bowl).sub(craterRim));
+    densityNode.element(idx).assign(base.sub(groundR.sub(PLANET_RADIUS)));
   });
   await renderer.computeAsync(densityFn().compute(numPoints));
   log('Density pass OK');
@@ -808,7 +816,7 @@ try{
 
     const dir = tslNormalize(newPos);
     const r = newPos.length();
-    const floorR = float(PLANET_RADIUS - 0.2);
+    const floorR = terrainRadiusAt(dir).sub(0.1); // sit fluid slightly below the visible terrain surface, matching sea-level convention rather than sitting exactly on top of it
     const belowFloor = r.lessThan(floorR);
     const correctedPos = mix(newPos, dir.mul(floorR), belowFloor);
     const correctedVel = mix(newVel, newVel.sub(dir.mul(newVel.dot(dir)).mul(1.4)), belowFloor);
@@ -823,7 +831,17 @@ try{
   const tideParticleGeo = new THREE.BufferGeometry();
   tideParticleGeo.setAttribute('position', tidePosBuf);
   tideParticleGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0,0,0), PLANET_RADIUS*1.5);
-  const tideParticleMat = new THREE.PointsNodeMaterial({ color:0x3fa8d8, size:0.35, transparent:true, opacity:0.85 });
+  // Real, honest scope note: this is still flat point-sprite rendering,
+  // not the actual SSFR (screen-space fluid rendering with extinction)
+  // technique ArcLake already implements - that's a genuinely separate,
+  // larger undertaking (depth-only particle pass, bilateral blur to
+  // merge nearby particles into a continuous surface, normal
+  // reconstruction from the smoothed depth, then extinction-based
+  // shading) that hasn't been built here yet. This just fixes the size
+  // being too small to see and enables proper distance attenuation, so
+  // there's something visible to evaluate while that bigger piece is
+  // planned separately.
+  const tideParticleMat = new THREE.PointsNodeMaterial({ color:0x3fa8d8, size:0.9, sizeAttenuation:true, transparent:true, opacity:0.9 });
   const tideParticles = new THREE.Points(tideParticleGeo, tideParticleMat);
   scene.add(tideParticles);
   moonMesh.visible = false; tideParticles.visible = false;
