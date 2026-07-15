@@ -30,9 +30,10 @@
 import * as THREE from 'three';
 import {
   Fn, If, Loop, storage, instanceIndex, uint, int, float, vec3, vec4,
-  select, mx_fractal_noise_float, normalWorld, positionWorld, positionView,
+  select, mx_fractal_noise_float, mx_worley_noise_float, normalWorld, positionWorld, positionView,
   cameraPosition, mix, viewportLinearDepth, linearDepth, screenUV, time,
-  normalize as tslNormalize, smoothstep, clamp, pow, reflect, dot
+  normalize as tslNormalize, smoothstep, clamp, pow, reflect, dot, exp, uniform,
+  texture, perspectiveDepthToViewZ, cameraNear, cameraFar
 } from 'three/tsl';
 import { EdgeVertexIndices, EdgeMasks, TriangleTable } from './mc_tables.js';
 
@@ -142,7 +143,26 @@ try{
     const n2 = mx_fractal_noise_float(dir.mul(6.9).add(vec3(9.1,2.3,4.7)), 3, 2.0, 0.5);
     const billow = n2.abs();
     const terrain = ridge.mul(ridge).mul(0.9).sub(billow.mul(0.35));
-    densityNode.element(idx).assign(base.sub(terrain.mul(1.4)));
+
+    // ── Craters, via Worley (cellular) noise. mx_worley_noise_float
+    // returns something distance-like from each point to its nearest
+    // random cell center - small right at a center, growing away from
+    // it. Using exp(-w^2 * k) turns that into a Gaussian bowl profile
+    // that's robust regardless of this implementation's exact output
+    // scale (no need to know its precise numeric range, just that it's
+    // ~0 at centers and grows outward). A second, larger-scale Worley
+    // layer gives bigger/rarer craters than the first, same idea two
+    // asteroid-belt games use to mix crater sizes.
+    const w1 = mx_worley_noise_float(dir.mul(4.2));
+    const profile1 = exp(w1.mul(w1).mul(-22.0));
+    const w2 = mx_worley_noise_float(dir.mul(1.6).add(vec3(31.0,7.0,19.0)));
+    const profile2 = exp(w2.mul(w2).mul(-38.0));
+    const bowl = profile1.mul(0.22).add(profile2.mul(0.55));
+    const rim1 = smoothstep(0.04,0.22,profile1).sub(smoothstep(0.22,0.42,profile1)).mul(0.06);
+    const rim2 = smoothstep(0.03,0.18,profile2).sub(smoothstep(0.18,0.34,profile2)).mul(0.14);
+    const craterRim = rim1.add(rim2);
+
+    densityNode.element(idx).assign(base.sub(terrain.mul(1.4)).add(bowl).sub(craterRim));
   });
   await renderer.computeAsync(densityFn().compute(numPoints));
   log('Density pass OK');
@@ -283,17 +303,45 @@ try{
   const waveN2 = mx_fractal_noise_float(wavePos2, 4, 2.0, 0.5);
   waterMat.normalNode = tslNormalize(normalWorld.add(vec3(waveN.mul(0.12), waveN2.mul(0.12), waveN.mul(waveN2).mul(0.08))));
 
-  scene.add(new THREE.Mesh(waterGeo, waterMat));
+  const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+  scene.add(waterMesh);
   log('Water sphere added (depth-aware, animated waves, shoreline foam)');
+
+  // ── Atmosphere: independent depth pass. Per the description of the
+  // reference approach - atmosphere fog/horizon shouldn't be computed
+  // from the same depth buffer the water pass uses (even though in
+  // practice water's depthWrite:false means it wouldn't actually
+  // interfere here, a genuinely separate pass makes that true by
+  // construction rather than by a detail of write-mask settings that
+  // could silently break if either material changes later). This
+  // render target + its own dedicated pre-pass render call exists only
+  // for the atmosphere to sample - completely decoupled from the main
+  // pass's own depth buffer that water reads via viewportLinearDepth.
+  const atmoDepthTarget = new THREE.RenderTarget(window.innerWidth, window.innerHeight);
+  atmoDepthTarget.depthTexture = new THREE.DepthTexture();
+  atmoDepthTarget.depthTexture.type = THREE.FloatType;
 
   const atmoGeo = new THREE.SphereGeometry(HALF*1.02, 48, 32);
   const atmoMat = new THREE.MeshBasicNodeMaterial({ transparent:true, side:THREE.BackSide, depthWrite:false, blending:THREE.AdditiveBlending });
   const viewDir = positionWorld.sub(cameraPosition).normalize();
   const fresnel = float(1.0).sub(viewDir.dot(normalWorld).abs()).pow(3.0);
-  atmoMat.colorNode = vec3(0.4,0.65,1.0).mul(fresnel).mul(1.4);
-  atmoMat.opacityNode = fresnel;
-  scene.add(new THREE.Mesh(atmoGeo, atmoMat));
-  log('Atmosphere shell added');
+
+  // Sample the atmosphere's OWN depth texture (not the shared scene
+  // depth water uses) to find how far away whatever's behind this sky
+  // pixel actually is - terrain close by (near the horizon/ground)
+  // gets thicker fog; open sky (nothing in the depth pre-pass, reads
+  // as far-plane) gets the plain Fresnel glow with no added fog.
+  const atmoDepthNode = texture(atmoDepthTarget.depthTexture, screenUV);
+  const atmoViewZ = perspectiveDepthToViewZ(atmoDepthNode.r, cameraNear, cameraFar);
+  const myViewZ = positionView.z;
+  const distThroughAtmo = atmoViewZ.sub(myViewZ).abs().clamp(0.0, 40.0).div(40.0);
+  const horizonFog = smoothstep(0.0, 0.5, distThroughAtmo);
+
+  atmoMat.colorNode = mix(vec3(0.4,0.65,1.0).mul(fresnel).mul(1.4), vec3(0.75,0.82,0.95), horizonFog.mul(fresnel));
+  atmoMat.opacityNode = clamp(fresnel.add(horizonFog.mul(fresnel).mul(0.6)), 0.0, 1.0);
+  const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
+  scene.add(atmoMesh);
+  log('Atmosphere shell added (independent depth pass for horizon fog)');
 
   const startDir = new THREE.Vector3(0.3,0.85,0.3).normalize();
   const player = {
@@ -463,6 +511,17 @@ try{
       sun.position.set(Math.cos(sunAngle)*80, Math.sin(sunAngle)*80, 30);
       const daylight = Math.max(0.15, Math.sin(sunAngle));
       sun.intensity = 1.0 + daylight*2.6;
+
+      // Independent depth pre-pass for the atmosphere: terrain only,
+      // water and atmosphere itself hidden, rendered into their own
+      // dedicated render target - never touches or is touched by the
+      // main pass's depth buffer that water reads from.
+      waterMesh.visible = false; atmoMesh.visible = false;
+      renderer.setRenderTarget(atmoDepthTarget);
+      await renderer.renderAsync(scene, camera);
+      renderer.setRenderTarget(null);
+      waterMesh.visible = true; atmoMesh.visible = true;
+
       await renderer.renderAsync(scene, camera);
       frameCount++;
       if(!loggedFirst){ loggedFirst=true; log('First frame rendered without error'); }
