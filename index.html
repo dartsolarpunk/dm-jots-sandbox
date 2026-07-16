@@ -8,7 +8,7 @@
 #joy-look{left:24px;}
 #joy-move{right:24px;}
 .joy-stick{position:absolute;top:50%;left:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;background:rgba(255,255,255,0.35);border:1px solid rgba(255,255,255,0.5);pointer-events:none;}
-#jump-btn{position:fixed;right:28px;bottom:172px;width:64px;height:64px;border-radius:50%;background:rgba(120,255,160,0.18);border:1px solid rgba(150,255,180,0.5);color:#cfffdd;font-family:monospace;font-size:11px;z-index:20;touch-action:none;display:flex;align-items:center;justify-content:center;}
+#jump-btn{position:fixed;left:28px;bottom:172px;width:64px;height:64px;border-radius:50%;background:rgba(120,255,160,0.18);border:1px solid rgba(150,255,180,0.5);color:#cfffdd;font-family:monospace;font-size:11px;z-index:20;touch-action:none;display:flex;align-items:center;justify-content:center;}
 #tab-header{position:fixed;top:0;left:0;right:0;height:44px;z-index:30;display:flex;background:rgba(8,9,16,0.88);border-bottom:1px solid rgba(150,170,255,0.25);backdrop-filter:blur(6px);}
 .tab-btn{flex:0 0 auto;padding:0 22px;height:100%;background:none;border:none;color:#7a86a8;font-family:monospace;font-size:13px;letter-spacing:0.04em;cursor:pointer;border-bottom:2px solid transparent;}
 .tab-btn.active{color:#cfe0ff;border-bottom:2px solid #7fb0ff;}
@@ -76,7 +76,7 @@ function fractalNoise3(x,y,z,octaves,lac,gain){
   for(let i=0;i<octaves;i++){ sum+=valueNoise3(x*freq,y*freq,z*freq)*amp; norm+=amp; amp*=gain; freq*=lac; }
   return sum/norm;
 }
-const PLANET_RADIUS = 12;
+const PLANET_RADIUS = 40;
 // Real bug found: this JS noise approximation never got updated when
 // craters were added to the GPU density function - the character's
 // collision "ground" and the actual rendered terrain silently drifted
@@ -113,7 +113,7 @@ function sampleDensityAt(wx, wy, wz){
 function groundRadiusReal(dirX,dirY,dirZ){
   const { HALF } = densityGridInfo;
   const step = 0.1;
-  let r = PLANET_RADIUS - 3.5;
+  let r = PLANET_RADIUS - 12;
   let prevD = sampleDensityAt(dirX*r, dirY*r, dirZ*r);
   const maxR = HALF*0.97;
   while(r < maxR){
@@ -145,20 +145,20 @@ try{
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x03040a);
   const walkCamera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.05, 500);
-  const orbitCamera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.5, 2000);
-  orbitCamera.position.set(0, 60, 160);
+  const orbitCamera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.5, 4000);
+  orbitCamera.position.set(0, 200, 530);
   const orbitControls = new OrbitControls(orbitCamera, renderer.domElement);
   orbitControls.enableDamping = true;
-  orbitControls.minDistance = 40;
-  orbitControls.maxDistance = 700;
+  orbitControls.minDistance = 130;
+  orbitControls.maxDistance = 2200;
   orbitControls.target.set(0,0,0);
 
-  const tidesCamera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.5, 2000);
-  tidesCamera.position.set(0, 45, 95);
+  const tidesCamera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.5, 4000);
+  tidesCamera.position.set(0, 150, 315);
   const tidesControls = new OrbitControls(tidesCamera, renderer.domElement);
   tidesControls.enableDamping = true;
-  tidesControls.minDistance = 30;
-  tidesControls.maxDistance = 400;
+  tidesControls.minDistance = 100;
+  tidesControls.maxDistance = 1300;
   tidesControls.target.set(0,0,0);
 
   let activeCamera = walkCamera;
@@ -167,7 +167,7 @@ try{
   {
     const N=2000, pos=new Float32Array(N*3);
     for(let i=0;i<N;i++){
-      const r=180+Math.random()*40, th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1);
+      const r=2600+Math.random()*400, th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1);
       pos[i*3]=r*Math.sin(ph)*Math.cos(th); pos[i*3+1]=r*Math.sin(ph)*Math.sin(th); pos[i*3+2]=r*Math.cos(ph);
     }
     const starGeo=new THREE.BufferGeometry();
@@ -180,7 +180,7 @@ try{
   scene.add(sun);
   scene.add(new THREE.AmbientLight(0x304050, 0.55));
 
-  const N = 46;
+  const N = 60;
   const GRID = N+1;
   const HALF = PLANET_RADIUS*1.35;
   const CELL = (HALF*2)/N;
@@ -232,7 +232,7 @@ try{
     const rim1 = smoothstep(0.04,0.22,profile1).sub(smoothstep(0.22,0.42,profile1)).mul(0.06);
     const rim2 = smoothstep(0.03,0.18,profile2).sub(smoothstep(0.18,0.34,profile2)).mul(0.14);
     const craterRim = rim1.add(rim2);
-    return float(PLANET_RADIUS).add(terrain.mul(1.4)).sub(bowl).add(craterRim);
+    return float(PLANET_RADIUS).add(terrain.mul(9.0)).sub(bowl.mul(6.4)).add(craterRim.mul(6.4));
   });
 
   const densityFn = Fn(()=>{
@@ -361,7 +361,7 @@ try{
   // shore = lighter/more see-through, deep = darker/more opaque),
   // shoreline foam (thickness near zero), and it's all recomputed live
   // if the terrain changes, no separate baked mask needed.
-  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+0.02, 120, 80);
+  const waterGeo = new THREE.SphereGeometry(PLANET_RADIUS+3.2, 160, 100);
   const waterMat = new THREE.MeshStandardNodeMaterial({
     transparent:true, side:THREE.DoubleSide, depthWrite:false, metalness:0.05,
   });
@@ -638,10 +638,15 @@ try{
   // updatePlayer() consumes and clears it next frame regardless of how
   // briefly the button was actually held.
   let jumpQueued = false;
+  window.__jumpAttempts = 0; window.__jumpExecutions = 0;
   const jumpBtn = document.getElementById('jump-btn');
-  jumpBtn.addEventListener('touchstart', e=>{ jumpQueued=true; e.preventDefault(); }, {passive:false});
-  jumpBtn.addEventListener('touchend', e=>{ e.preventDefault(); }, {passive:false});
-  window.addEventListener('keydown', e=>{ if(e.code==='Space') jumpQueued=true; });
+  jumpBtn.addEventListener('touchstart', e=>{
+    jumpQueued=true; window.__jumpAttempts++;
+    jumpBtn.style.background = 'rgba(120,255,160,0.55)'; // visible tap feedback, confirms the touch was actually registered at the DOM level
+    e.preventDefault();
+  }, {passive:false});
+  jumpBtn.addEventListener('touchend', e=>{ jumpBtn.style.background = 'rgba(120,255,160,0.18)'; e.preventDefault(); }, {passive:false});
+  window.addEventListener('keydown', e=>{ if(e.code==='Space'){ jumpQueued=true; window.__jumpAttempts++; } });
 
   const GRAVITY = 9.0;
   const MOVE_SPEED = 4.5;
@@ -674,12 +679,14 @@ try{
     moveVec.multiplyScalar(MOVE_SPEED);
 
     player.vel.addScaledVector(tmpUp, -GRAVITY*dt);
-    player.vel.copy(moveVec).addScaledVector(tmpUp, player.vel.dot(tmpUp));
+    const radialVel = player.vel.dot(tmpUp); // capture BEFORE mutating vel below
+    player.vel.copy(moveVec).addScaledVector(tmpUp, radialVel);
 
     if(jumpQueued && player.onGround){
       jumpQueued = false;
       player.vel.addScaledVector(tmpUp, JUMP_SPEED);
       player.onGround = false;
+      window.__jumpExecutions++;
     }
 
     player.pos.addScaledVector(player.vel, dt);
@@ -719,13 +726,13 @@ try{
   // discrete SPH particles are two different representations of "the
   // ocean" and would look redundant/cluttered shown together, so each
   // tab shows only the one that matches what it's demonstrating.
-  const MOON_ORBIT_RADIUS = 70;
+  const MOON_ORBIT_RADIUS = 230;
   const MOON_RADIUS = 4.5;
   const moonMesh = new THREE.Mesh(new THREE.SphereGeometry(MOON_RADIUS,32,24), new THREE.MeshStandardMaterial({color:0xaaaaaa, roughness:1.0}));
   scene.add(moonMesh);
   const moonPosUniform = uniform(new THREE.Vector3(MOON_ORBIT_RADIUS,0,0));
 
-  const N_PARTICLES = 1400;
+  const N_PARTICLES = 2600;
   const SMOOTHING_RADIUS = 1.6;
   const REST_DENSITY = 2.0;
   const PRESSURE_STIFFNESS = 4.0;
@@ -887,14 +894,23 @@ try{
   let frameCount=0, loggedFirst=false;
   let sunAngle = 0.6;
   let moonAngle = 0.0;
+  let lastDiagLog = 0;
   async function frame(){
     const now = performance.now();
     const dt = Math.min((now-last)/1000, 0.05);
     last = now;
+    if(currentTab==='walk' && now-lastDiagLog>1000){
+      lastDiagLog = now;
+      log('[jump diag] attempts:'+window.__jumpAttempts+' executions:'+window.__jumpExecutions+' onGround:'+player.onGround);
+    }
     try{
       if(currentTab==='walk'){
-        updatePlayer(dt);
-        updateCamera();
+        try{
+          updatePlayer(dt);
+          updateCamera();
+        }catch(errUP){
+          if(frameCount%60===0) log('[updatePlayer ERROR] '+errUP.message+'\n'+errUP.stack.split('\n').slice(0,3).join('\n'));
+        }
       } else if(currentTab==='orbit'){
         orbitControls.update();
       } else {
